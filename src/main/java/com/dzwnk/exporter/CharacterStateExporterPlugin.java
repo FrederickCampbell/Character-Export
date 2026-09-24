@@ -28,7 +28,6 @@ package com.dzwnk.exporter;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.util.concurrent.ThreadFactoryBuilder;
 import com.google.gson.Gson;
-import com.google.gson.GsonBuilder;
 import com.google.inject.Provides;
 import java.awt.Color;
 import java.awt.Graphics2D;
@@ -54,6 +53,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import javax.imageio.ImageIO;
 import javax.inject.Inject;
@@ -61,28 +61,35 @@ import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
 import net.runelite.api.GameState;
 import net.runelite.api.Item;
+import net.runelite.api.MenuAction;
 import net.runelite.api.ItemComposition;
 import net.runelite.api.ItemContainer;
 import net.runelite.api.Player;
 import net.runelite.api.Quest;
+import net.runelite.api.ScriptEvent;
 import net.runelite.api.QuestState;
 import net.runelite.api.Skill;
-import net.runelite.api.StructComposition;
 import net.runelite.api.WorldType;
 import net.runelite.api.events.CommandExecuted;
 import net.runelite.api.events.GameStateChanged;
 import net.runelite.api.events.GameTick;
 import net.runelite.api.events.ItemContainerChanged;
 import net.runelite.api.events.ScriptPostFired;
+import net.runelite.api.events.ScriptPreFired;
 import net.runelite.api.events.StatChanged;
 import net.runelite.api.events.VarbitChanged;
 import net.runelite.api.events.WidgetLoaded;
+import net.runelite.api.gameval.InterfaceID;
 import net.runelite.api.gameval.InventoryID;
+import net.runelite.api.gameval.ItemID;
+import net.runelite.api.gameval.VarbitID;
 import net.runelite.api.widgets.Widget;
 import net.runelite.client.RuneLite;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.config.ConfigManager;
+import net.runelite.client.eventbus.EventBus;
 import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.events.PluginMessage;
 import net.runelite.client.game.ItemManager;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
@@ -92,12 +99,12 @@ import net.runelite.client.ui.NavigationButton;
 @Slf4j
 @PluginDescriptor(
     name = "Character Export",
-    description = "Saves stats, quests, diaries, combat achievements, bank, inventory, equipment, and collection log as local JSON files in .runelite/character-exporter/.",
+    description = "Exports structured local RuneLite-observable character and account state as JSON.",
     tags = {"export", "data", "bank", "quests", "stats", "seed", "inventory", "equipment", "diary", "combat", "collection", "log"}
 )
 public class CharacterStateExporterPlugin extends Plugin
 {
-    private static final String PLUGIN_VERSION = "0.6.0";
+    private static final String PLUGIN_VERSION = "0.9.1-refactor-rc6";
     private static final Path RUNELITE_DIR = RuneLite.RUNELITE_DIR.toPath().toAbsolutePath().normalize();
     private static final Path BASE_OUTPUT_DIR = RUNELITE_DIR.resolve("character-exporter").normalize();
     // Initialised in startUp() from the injected Gson to satisfy plugin-hub rules.
@@ -106,6 +113,11 @@ public class CharacterStateExporterPlugin extends Plugin
     private static final String CHARACTER_FILE = "character.json";
     private static final String QUESTS_FILE = "quests.json";
     private static final String DIARIES_FILE = "diaries.json";
+    private static final String PROGRESS_FLAGS_FILE = "progress_flags.json";
+    private static final String PROGRESS_MANIFEST_FILE = "progress_manifest.json";
+    private static final String TRAVEL_GATES_FILE = "travel_gates.json";
+    private static final String STATE_FILE = "state.json";
+    private static final String LIVE_FILE = "live.json";
     private static final String COMBAT_ACHIEVEMENTS_FILE = "combat_achievements.json";
     private static final String COLLECTION_LOG_FILE = "collection_log.json";
     private static final String STATUS_FILE = "status.json";
@@ -117,9 +129,17 @@ public class CharacterStateExporterPlugin extends Plugin
     private static final long CONTAINER_EXPORT_INTERVAL_MS = 1000L;
     private static final long INVENTORY_EXPORT_INTERVAL_MS = 5000L;
     private static final long DIARY_EXPORT_INTERVAL_MS = 5000L;
+    private static final long PROGRESS_EXPORT_INTERVAL_MS = 250L;
+    private static final long TRAVEL_GATE_EXPORT_INTERVAL_MS = 1000L;
+    private static final long UNIVERSAL_STATE_EXPORT_INTERVAL_MS = 2000L;
     private static final long COMBAT_ACHIEVEMENT_EXPORT_INTERVAL_MS = 5000L;
     private static final long COLLECTION_LOG_EXPORT_INTERVAL_MS = 2000L;
+    private static final long DWMS_STORAGE_EXPORT_INTERVAL_MS = 5000L;
     private static final long OBSERVABILITY_WRITE_INTERVAL_MS = 1000L;
+    private static final int COLLECTION_LOG_DELAYED_TRANSMIT_SCRIPT = 4100;
+    private static final int COLLECTION_LOG_SETUP_SCRIPT = 7797;
+    private static final int COLLECTION_LOG_INIT_SCRIPT = 2240;
+    private static final int COLLECTION_LOG_TRANSMIT_SETTLE_TICKS = 3;
 
     // Achievement diary definitions: {name, easy_varbit, medium_varbit, hard_varbit, elite_varbit}
     // Order must match DIARY_COUNT_VARBITS and DIARY_WIDGET_TITLES
@@ -138,35 +158,6 @@ public class CharacterStateExporterPlugin extends Plugin
         {"Wilderness", 4466, 4467, 4468, 4469},
     };
     private static final String[] DIARY_TIERS = {"easy", "medium", "hard", "elite"};
-    private enum DiaryContinuationKind
-    {
-        NONE,
-        TEXT,
-        REQUIREMENT
-    }
-
-    static final class DiaryWidgetLine
-    {
-        private final String text;
-        private final boolean complete;
-
-        private DiaryWidgetLine(String text, boolean complete)
-        {
-            this.text = text;
-            this.complete = complete;
-        }
-
-        String getText()
-        {
-            return text;
-        }
-
-        boolean isComplete()
-        {
-            return complete;
-        }
-    }
-
     // Task count varbits per diary area/tier — order matches DIARY_DEFINITIONS
     private static final int[][] DIARY_COUNT_VARBITS = {
         {6291, 6292, 6293, 6294}, // Ardougne
@@ -246,91 +237,6 @@ public class CharacterStateExporterPlugin extends Plugin
     };
     private static final int[] KARAMJA_HARD_TASK_VARBITS = {3600, 3601, 3602, 3603, 3604, 3605, 3606, 3607, 3608, 3609};
 
-    // Combat achievement struct param IDs
-    private static final int CA_PARAM_ID = 1306;
-    private static final int CA_PARAM_NAME = 1308;
-    private static final int CA_PARAM_TIER = 1310;
-
-    // Combat achievement varPlayers (20, covering all 637 tasks as bit-packed completion flags)
-    private static final int[] COMBAT_TASK_VARPS = {
-        3116, 3117, 3118, 3119, 3120, 3121, 3122, 3123, 3124, 3125,
-        3126, 3127, 3128, 3387, 3718, 3773, 3774, 4204, 4496, 4721,
-    };
-
-    // Combat achievement tier names and completion varbits
-    private static final String[] CA_TIER_NAMES = {"easy", "medium", "hard", "elite", "master", "grandmaster"};
-    private static final int[] CA_TIER_COMPLETE_VARBITS = {12863, 12864, 12865, 12866, 12867, 12868};
-    private static final int[] CA_TASK_COUNT_VARBITS = {12885, 12886, 12887, 12888, 12889, 12890};
-
-    // Combat achievement struct IDs: index = sortId (0–636), value = game cache structId
-    // Source: osrs-reldo/task-json-store tasks/COMBAT.min.json
-    private static final int[] COMBAT_STRUCT_IDS = {
-        327, 3164, 3168, 3172, 3173, 3175, 3177, 3179, 3180, 3181,     // 0–9
-        3216, 3220, 3538, 3260, 3261, 3262, 3269, 3271, 3274, 3302,     // 10–19
-        3314, 3600, 3317, 3346, 3419, 3421, 3422, 3425, 3427, 3493,     // 20–29
-        3496, 3497, 3500, 834, 836, 2625, 2628, 3060, 6382, 6387,       // 30–39
-        6408, 3539, 3165, 3166, 3167, 3174, 3176, 3178, 3186, 3188,     // 40–49
-        3201, 3203, 3210, 3212, 3213, 3217, 3218, 3219, 3237, 3270,     // 50–59
-        3272, 3273, 3303, 3304, 3305, 3306, 3313, 3318, 3322, 3337,     // 60–69
-        3341, 3344, 3347, 3350, 3363, 3373, 3420, 3423, 3424, 3184,     // 70–79
-        3494, 3499, 835, 837, 838, 917, 918, 925, 926, 1024,            // 80–89
-        1030, 1035, 1040, 2577, 2623, 3814, 6383, 6384, 6385, 6409,     // 90–99
-        6411, 328, 380, 399, 404, 410, 550, 3156, 3158, 3160,           // 100–109
-        3169, 3170, 3182, 3185, 3197, 3199, 3200, 3202, 3204, 3211,     // 110–119
-        3222, 3224, 3225, 3226, 3227, 3228, 3263, 3264, 3265, 3297,     // 120–129
-        3299, 3307, 3308, 3309, 3310, 3319, 3321, 3323, 3338, 3342,     // 130–139
-        3348, 3349, 3351, 3353, 3358, 3360, 3361, 3364, 3374, 3537,     // 140–149
-        3404, 3406, 3426, 3472, 3474, 3475, 3479, 3495, 3498, 4433,     // 150–159
-        4434, 4436, 4437, 4483, 920, 921, 924, 927, 928, 890,           // 160–169
-        919, 1025, 1028, 1031, 1036, 1037, 1039, 1042, 1043, 2535,      // 170–179
-        2626, 2627, 2630, 6386, 6388, 6412, 366, 388, 400, 405,         // 180–189
-        443, 3157, 3159, 3171, 3183, 3187, 3189, 3191, 3194, 3195,      // 190–199
-        3196, 3198, 3205, 3207, 3208, 3209, 3214, 3215, 3221, 3223,     // 200–209
-        3229, 3230, 3232, 3235, 3238, 3241, 3249, 3251, 3254, 3255,     // 210–219
-        3256, 3259, 3266, 3267, 3275, 3287, 3293, 3298, 3300, 3301,     // 220–229
-        3311, 3316, 3320, 3324, 3327, 3329, 3331, 3334, 3339, 3340,     // 230–239
-        3343, 3345, 3352, 3356, 3359, 3362, 3365, 3367, 3368, 3370,     // 240–249
-        3375, 3376, 3526, 3527, 3528, 3529, 3530, 3531, 3532, 3533,     // 250–259
-        3534, 3535, 3377, 3401, 3402, 3403, 3405, 3407, 3408, 3413,     // 260–269
-        3411, 3432, 3439, 3442, 3443, 3448, 3447, 3451, 3452, 3454,     // 270–279
-        3456, 3460, 3461, 3468, 3469, 3470, 3471, 3473, 3477, 3476,     // 280–289
-        3481, 3289, 3501, 3504, 3507, 304, 4137, 4139, 4435, 4440,      // 290–299
-        4441, 4402, 4403, 4397, 4421, 4423, 4430, 4404, 4407, 4410,     // 300–309
-        4424, 4480, 4484, 4478, 4487, 826, 791, 802, 813, 821,          // 310–319
-        786, 799, 810, 808, 916, 935, 938, 943, 970, 971,               // 320–329
-        972, 974, 1000, 1008, 1002, 1032, 1026, 1027, 1038, 1041,       // 330–339
-        3019, 4739, 4809, 4861, 999, 4558, 4566, 6410, 446, 602,        // 340–349
-        3190, 3192, 3193, 3206, 3231, 3233, 3236, 3239, 3242, 3243,     // 350–359
-        3245, 3247, 3250, 3252, 3253, 3257, 3268, 3276, 3277, 3278,     // 360–369
-        3279, 3280, 3281, 3282, 3284, 3286, 3288, 3290, 3292, 3295,     // 370–379
-        3312, 3325, 3328, 3332, 3335, 3355, 3366, 3369, 3371, 3390,     // 380–389
-        3384, 3380, 3385, 3386, 3382, 3387, 3391, 3388, 3381, 3389,     // 390–399
-        3393, 3395, 3397, 3399, 3378, 3409, 3410, 3412, 3416, 3418,     // 400–409
-        3428, 3430, 3431, 3433, 3435, 3437, 3440, 3444, 3445, 3446,     // 410–419
-        3449, 3450, 3453, 3455, 3457, 3458, 3459, 3462, 3466, 3464,     // 420–429
-        3486, 3502, 3505, 3508, 3509, 3511, 3521, 3536, 922, 940,       // 430–439
-        958, 959, 967, 4138, 4140, 4141, 4142, 4143, 4147, 4396,        // 440–449
-        4438, 4439, 4393, 4419, 4442, 4425, 4427, 4428, 4429, 4431,     // 450–459
-        4432, 4398, 4399, 4400, 4401, 4405, 4408, 4411, 4413, 4414,     // 460–469
-        4416, 4477, 4479, 4481, 4485, 4488, 4486, 807, 827, 792,        // 470–479
-        803, 816, 822, 789, 800, 811, 830, 829, 819, 818,               // 480–489
-        798, 794, 929, 933, 937, 939, 944, 973, 1001, 1003,             // 490–499
-        1005, 1007, 1010, 1011, 1029, 1033, 4740, 4810, 4857, 4859,     // 500–509
-        4860, 4556, 4559, 4560, 4565, 4567, 718, 1690, 3161, 3162,      // 510–519
-        3163, 3234, 3240, 3244, 3246, 3248, 3258, 3283, 3285, 3291,     // 520–529
-        3294, 3296, 3326, 3330, 3333, 3336, 3354, 3357, 3372, 3379,     // 530–539
-        3383, 3392, 3394, 3396, 3398, 3400, 3414, 3415, 3417, 3429,     // 540–549
-        3434, 3436, 3438, 3441, 3463, 3467, 3465, 3478, 3480, 3482,     // 550–559
-        3483, 3484, 3485, 3487, 3488, 3489, 3490, 3491, 3492, 3503,     // 560–569
-        3506, 3510, 3512, 3513, 3514, 3515, 3516, 3517, 3518, 3519,     // 570–579
-        3520, 3522, 3523, 3524, 3525, 931, 932, 950, 2860, 4144,        // 580–589
-        4145, 4146, 4394, 4395, 4418, 4420, 4443, 4422, 4426, 4406,     // 590–599
-        4409, 4412, 4415, 4417, 4489, 4482, 828, 793, 804, 817,         // 600–609
-        825, 790, 801, 812, 795, 820, 809, 831, 930, 934,               // 610–619
-        936, 942, 945, 1004, 1006, 1009, 1034, 4863, 4856, 4862,        // 620–629
-        4557, 4561, 4562, 4563, 4564, 4568, 4569,                       // 630–636
-    };
-
     // Collection log interface and script IDs
     private static final int COLLECTION_LOG_INTERFACE_ID = 621;
     private static final int COLLECTION_LOG_ACTIVE_TAB_VARBIT = 6905;
@@ -368,8 +274,13 @@ public class CharacterStateExporterPlugin extends Plugin
     @Inject
     private Gson gson;
 
+    @Inject
+    private ConfigManager configManager;
+
+    @Inject
+    private EventBus eventBus;
+
     private final Map<String, AtomicLong> lastExportAt = new ConcurrentHashMap<>();
-    private final Map<String, String> lastStablePayloadByFile = new ConcurrentHashMap<>();
     private final Map<String, Map<String, Object>> datasetStatus = new ConcurrentHashMap<>();
     private final Map<String, Object> readinessSnapshot = new ConcurrentHashMap<>();
     private final Set<String> warnedFailureKeys = ConcurrentHashMap.newKeySet();
@@ -377,20 +288,40 @@ public class CharacterStateExporterPlugin extends Plugin
     private final AtomicLong lastObservabilityWriteAt = new AtomicLong(0L);
     private final String sessionId = UUID.randomUUID().toString();
 
-    // Combat achievement task cache: loaded from game cache structs at login
-    private final List<CombatTask> combatTaskCache = new ArrayList<>();
+    private final CombatAchievementExporter combatAchievementExporter =
+        new CombatAchievementExporter();
+
+    private final DwmsStorageBridge dwmsStorageBridge =
+        new DwmsStorageBridge();
 
     // Diary journal widget-scraped task data: area name → tier → list of {name, complete}
     private final Map<String, Map<String, List<Map<String, Object>>>> diaryWidgetCache = new ConcurrentHashMap<>();
+    private final Set<String> diaryWidgetAreasObservedThisSession = ConcurrentHashMap.newKeySet();
 
-    // Collection log accumulated data: entry name → {tab, items, counts, last_scraped}
+    // Collection log accumulated page metadata retained for backwards compatibility.
     private final Map<String, Map<String, Object>> collectionLogCache = new ConcurrentHashMap<>();
 
+    // Whole-log owned-item snapshot received from the native Collection Log Search
+    // transmission (also used by RuneProfile/WikiSync-style consumers).
+    private final Map<Integer, Integer> collectionWholeLogQuantities = new ConcurrentHashMap<>();
+    private volatile boolean collectionWholeLogDirty;
+    private volatile int collectionWholeLogLastTransmitTick = -1;
+    private volatile String collectionWholeLogLastObservedAt;
+    private volatile String collectionWholeLogObservedSessionId;
+    private volatile boolean collectionFullReadTriggeredThisSession;
+    private volatile boolean collectionFullReadPending;
+
+    private final AtomicBoolean unifiedRebuildQueued =
+        new AtomicBoolean(false);
+    private volatile ExportStore exportStore;
     private volatile ExecutorService writer;
     private volatile boolean pendingInitialCharacterExport;
     private volatile boolean writesEnabled;
     private volatile Path accountOutputDir;
     private volatile String currentAccountName;
+    private volatile String currentAccountHash;
+    private volatile boolean pendingBankRefresh;
+    private volatile boolean pendingSeedVaultRefresh;
     private CharacterStateExporterPanel panel;
     private NavigationButton navButton;
 
@@ -414,9 +345,19 @@ public class CharacterStateExporterPlugin extends Plugin
                 .setNameFormat("character-state-exporter-%d")
                 .build()
         );
+        exportStore = new ExportStore(
+            prettyGson,
+            PLUGIN_VERSION,
+            sessionId
+        );
         writesEnabled = initializeBaseOutputDirectory();
 
-        panel = new CharacterStateExporterPanel(this::manualExportAll);
+        panel = new CharacterStateExporterPanel(
+            this::manualExportAll,
+            PLUGIN_VERSION,
+            prettyGson,
+            sessionId
+        );
         navButton = NavigationButton.builder()
             .tooltip("Character Export")
             .icon(createSidebarIcon())
@@ -428,11 +369,6 @@ public class CharacterStateExporterPlugin extends Plugin
         debug("startup", "export toggles character={} quests={} diaries={} combatAchievements={} bank={} seedVault={} inventory={} equipment={}",
             config.exportCharacter(), config.exportQuests(), config.exportDiaries(), config.exportCombatAchievements(),
             config.exportBank(), config.exportSeedVault(), config.exportInventory(), config.exportEquipment());
-
-        if (writesEnabled && config.debugLogging())
-        {
-            submitWriter(this::resetExporterLogSync);
-        }
 
         recordEvent("startup", "plugin_started", ImmutableMap.of(
             "writes_enabled", writesEnabled
@@ -446,6 +382,7 @@ public class CharacterStateExporterPlugin extends Plugin
                 resolveAccount();
                 loadCombatTaskCache();
                 restoreCollectionLogCache();
+                restoreDiaryWidgetCache();
             }
 
             updateReadinessSnapshot();
@@ -455,7 +392,11 @@ public class CharacterStateExporterPlugin extends Plugin
             {
                 exportQuestSnapshot("startup");
                 exportDiarySnapshot("startup");
+                exportProgressFlags("startup");
+                exportTravelGates("startup");
+                exportUniversalState("startup");
                 exportCombatAchievementSnapshot("startup");
+                requestDwmsStorageSnapshot("startup", 0L);
             }
         });
     }
@@ -463,7 +404,15 @@ public class CharacterStateExporterPlugin extends Plugin
     @Override
     protected void shutDown()
     {
-        clientToolbar.removeNavigation(navButton);
+        if (panel != null)
+        {
+            panel.shutdown();
+        }
+        if (navButton != null)
+        {
+            clientToolbar.removeNavigation(navButton);
+        }
+
         debug("shutdown", "plugin shutting down");
         recordEvent("shutdown", "plugin_stopped", ImmutableMap.of());
         requestObservabilityWrite(true);
@@ -507,20 +456,47 @@ public class CharacterStateExporterPlugin extends Plugin
             {
                 loadCombatTaskCache();
                 restoreCollectionLogCache();
+                restoreDiaryWidgetCache();
                 exportQuestSnapshot("game_state_changed");
                 exportDiarySnapshot("game_state_changed");
+                exportProgressFlags("game_state_changed");
+                exportTravelGates("game_state_changed");
+                exportUniversalState("game_state_changed");
                 exportCombatAchievementSnapshot("game_state_changed");
+                requestDwmsStorageSnapshot("game_state_changed", 0L);
             });
         }
         else if (gameState == GameState.LOGIN_SCREEN)
         {
             accountOutputDir = null;
             currentAccountName = null;
-            combatTaskCache.clear();
+            currentAccountHash = null;
+            pendingBankRefresh = false;
+            pendingSeedVaultRefresh = false;
+            combatAchievementExporter.clear();
             diaryWidgetCache.clear();
+            diaryWidgetAreasObservedThisSession.clear();
             collectionLogCache.clear();
+            collectionWholeLogQuantities.clear();
+            collectionWholeLogDirty = false;
+            collectionWholeLogLastTransmitTick = -1;
+            collectionWholeLogLastObservedAt = null;
+            collectionWholeLogObservedSessionId = null;
+            collectionFullReadTriggeredThisSession = false;
+            collectionFullReadPending = false;
+            dwmsStorageBridge.resetSession();
+            unifiedRebuildQueued.set(false);
+            if (exportStore != null)
+            {
+                exportStore.clearStableCache();
+            }
+            lastExportAt.clear();
+            datasetStatus.clear();
+            synchronized (recentEvents)
+            {
+                recentEvents.clear();
+            }
             panel.clearAccount();
-            lastStablePayloadByFile.clear();
         }
 
         updateReadinessSnapshot();
@@ -537,6 +513,18 @@ public class CharacterStateExporterPlugin extends Plugin
             resolveAccount();
         }
 
+        refreshPanelAccountIdentity();
+        flushPendingContainerRefreshes();
+        flushCollectionLogWholeSnapshot();
+        exportUniversalState(
+            "game_tick",
+            UNIVERSAL_STATE_EXPORT_INTERVAL_MS
+        );
+        requestDwmsStorageSnapshot(
+            "game_tick",
+            DWMS_STORAGE_EXPORT_INTERVAL_MS
+        );
+
         if (!pendingInitialCharacterExport || client.getGameState() != GameState.LOGGED_IN)
         {
             return;
@@ -551,11 +539,188 @@ public class CharacterStateExporterPlugin extends Plugin
         pendingInitialCharacterExport = false;
         updateReadinessSnapshot();
         exportCharacterSnapshot("initial_game_tick");
+        exportProgressFlags("initial_game_tick");
+        exportTravelGates("initial_game_tick");
+        exportUniversalState("initial_game_tick");
         requestObservabilityWrite(false);
     }
 
     @Subscribe
+    public void onPluginMessage(PluginMessage message)
+    {
+        if (!dwmsStorageBridge.accept(message))
+        {
+            return;
+        }
+
+        exportDwmsStorageSnapshot("dwms_plugin_message");
+    }
+
+    private void requestDwmsStorageSnapshot(
+        String reason,
+        long minimumIntervalMs)
+    {
+        if (client.getGameState() != GameState.LOGGED_IN ||
+            accountOutputDir == null ||
+            exportStore == null)
+        {
+            return;
+        }
+
+        if (!acquireExportSlot(
+            "dwms_storage_request",
+            minimumIntervalMs
+        ))
+        {
+            return;
+        }
+
+        // Persist the entire saved DWMS RS-profile storage namespace first.
+        // This remains useful even when DWMS is disabled or an older DWMS build
+        // does not implement the PluginMessage protocol. A live response then
+        // enriches the same fragment with normalized item-bearing storages.
+        exportDwmsStorageSnapshot(reason + "_profile");
+
+        try
+        {
+            eventBus.post(dwmsStorageBridge.requestMessage());
+        }
+        catch (RuntimeException ex)
+        {
+            debug(
+                "storage",
+                "DWMS storage request failed: {}",
+                ex.toString()
+            );
+        }
+    }
+
+    private void exportDwmsStorageSnapshot(String reason)
+    {
+        Map<String, Object> payload = dwmsStorageBridge.buildSnapshot(
+            configManager,
+            PLUGIN_VERSION,
+            sessionId,
+            reason
+        );
+        enrichDwmsItemNames(payload);
+        writeJson(
+            ExportDataset.STORAGE.key(),
+            ExportDataset.STORAGE.fragmentFileName(),
+            payload
+        );
+    }
+
+    @SuppressWarnings("unchecked")
+    private void enrichDwmsItemNames(Map<String, Object> payload)
+    {
+        Object storagesValue = payload.get("normalized_item_storages");
+        if (!(storagesValue instanceof List))
+        {
+            return;
+        }
+
+        for (Object storageValue : (List<?>) storagesValue)
+        {
+            if (!(storageValue instanceof Map))
+            {
+                continue;
+            }
+
+            Object itemsValue =
+                ((Map<String, Object>) storageValue).get("items");
+            if (!(itemsValue instanceof List))
+            {
+                continue;
+            }
+
+            for (Object itemValue : (List<?>) itemsValue)
+            {
+                if (!(itemValue instanceof Map))
+                {
+                    continue;
+                }
+
+                Map<String, Object> item =
+                    (Map<String, Object>) itemValue;
+                Object idValue = item.get("id");
+                if (!(idValue instanceof Number))
+                {
+                    continue;
+                }
+
+                item.put(
+                    "name",
+                    safeItemName(((Number) idValue).intValue())
+                );
+            }
+        }
+    }
+
+    private void refreshPanelAccountIdentity()
+    {
+        if (client.getGameState() != GameState.LOGGED_IN ||
+            accountOutputDir == null)
+        {
+            return;
+        }
+
+        Player player = client.getLocalPlayer();
+        if (player == null || player.getName() == null ||
+            player.getName().trim().isEmpty())
+        {
+            return;
+        }
+
+        try
+        {
+            ExportLayout.migrateLegacyFiles(accountOutputDir);
+            ExportLayout.cleanupRetiredCacheFiles(accountOutputDir);
+        }
+        catch (IOException ex)
+        {
+            warnOnce(
+                "layout:migrate",
+                "Failed migrating Character Export account layout",
+                ex
+            );
+        }
+
+        panel.refreshAccountIdentity(player.getName().trim(), accountOutputDir);
+    }
+
+    private void flushPendingContainerRefreshes()
+    {
+        if (client.getGameState() != GameState.LOGGED_IN)
+        {
+            return;
+        }
+
+        if (pendingBankRefresh &&
+            client.getItemContainer(InventoryID.BANK) != null)
+        {
+            pendingBankRefresh = false;
+            exportContainerSnapshot(
+                ContainerKind.BANK,
+                "bank_widget_loaded",
+                0L
+            );
+        }
+
+        if (pendingSeedVaultRefresh &&
+            client.getItemContainer(InventoryID.SEED_VAULT) != null)
+        {
+            pendingSeedVaultRefresh = false;
+            exportContainerSnapshot(
+                ContainerKind.SEED_VAULT,
+                "seed_vault_widget_loaded",
+                0L
+            );
+        }
+    }
+    @Subscribe
     public void onStatChanged(StatChanged event)
+
     {
         updateReadinessSnapshot();
         debug("stat_changed", "StatChanged skill={} real={} boosted={} xp={}",
@@ -566,6 +731,10 @@ public class CharacterStateExporterPlugin extends Plugin
     @Subscribe
     public void onVarbitChanged(VarbitChanged event)
     {
+        clientThread.invokeLater(() ->
+            exportProgressFlags("varbit_changed", PROGRESS_EXPORT_INTERVAL_MS));
+        clientThread.invokeLater(() ->
+            exportTravelGates("varbit_changed", TRAVEL_GATE_EXPORT_INTERVAL_MS));
         boolean anyExportNeeded = false;
 
         if (config.exportQuests())
@@ -612,6 +781,16 @@ public class CharacterStateExporterPlugin extends Plugin
     public void onWidgetLoaded(WidgetLoaded event)
     {
         int groupId = event.getGroupId();
+
+        if (groupId == InterfaceID.BANKMAIN)
+        {
+            pendingBankRefresh = true;
+        }
+        else if (groupId == InterfaceID.SEED_VAULT)
+        {
+            pendingSeedVaultRefresh = true;
+        }
+
         if (groupId == JOURNAL_INTERFACE_ID)
         {
             clientThread.invokeLater(this::scrapeDiaryJournal);
@@ -624,9 +803,170 @@ public class CharacterStateExporterPlugin extends Plugin
     }
 
     @Subscribe
+    public void onScriptPreFired(ScriptPreFired event)
+    {
+        if (!config.exportCollectionLog() ||
+            client.getGameState() != GameState.LOGGED_IN ||
+            event.getScriptId() != COLLECTION_LOG_DELAYED_TRANSMIT_SCRIPT ||
+            isAnotherPlayersCollectionLog())
+        {
+            return;
+        }
+
+        ScriptEvent scriptEvent = event.getScriptEvent();
+        Object[] arguments =
+            scriptEvent == null ? null : scriptEvent.getArguments();
+
+        if (arguments == null || arguments.length < 3 ||
+            !(arguments[1] instanceof Integer) ||
+            !(arguments[2] instanceof Integer))
+        {
+            return;
+        }
+
+        int itemId = (Integer) arguments[1];
+        int quantity = (Integer) arguments[2];
+        if (itemId <= 0 || quantity <= 0)
+        {
+            return;
+        }
+
+        int canonicalId = itemManager.canonicalize(itemId);
+        collectionWholeLogQuantities.merge(
+            canonicalId,
+            quantity,
+            Math::max
+        );
+        collectionWholeLogDirty = true;
+        collectionWholeLogLastTransmitTick = client.getTickCount();
+    }
+
+    private boolean isAnotherPlayersCollectionLog()
+    {
+        try
+        {
+            return client.getVarbitValue(
+                VarbitID.COLLECTION_POH_HOST_BOOK_OPEN
+            ) == 1;
+        }
+        catch (RuntimeException ex)
+        {
+            return false;
+        }
+    }
+
+    private void flushCollectionLogWholeSnapshot()
+    {
+        int tick = client.getTickCount();
+
+        if (collectionWholeLogDirty &&
+            collectionWholeLogLastTransmitTick >= 0 &&
+            tick > collectionWholeLogLastTransmitTick +
+                COLLECTION_LOG_TRANSMIT_SETTLE_TICKS)
+        {
+            collectionWholeLogDirty = false;
+            collectionWholeLogLastTransmitTick = -1;
+
+            boolean completedFullRead = collectionFullReadPending;
+            if (completedFullRead)
+            {
+                collectionFullReadPending = false;
+                collectionWholeLogLastObservedAt =
+                    OffsetDateTime.now().toString();
+                collectionWholeLogObservedSessionId = sessionId;
+            }
+
+            recordEvent(
+                "collection_log",
+                completedFullRead
+                    ? "collection_log_whole_snapshot_observed"
+                    : "collection_log_incremental_update",
+                ImmutableMap.of(
+                    "owned_item_types",
+                    collectionWholeLogQuantities.size()
+                )
+            );
+
+            writeCollectionLogSnapshot(
+                completedFullRead
+                    ? "collection_log_auto_full_snapshot"
+                    : "collection_log_incremental_update"
+            );
+            return;
+        }
+
+    }
+
+
+    private void maybeTriggerCollectionLogFullRead()
+    {
+        if (!config.exportCollectionLog() ||
+            client.getGameState() != GameState.LOGGED_IN ||
+            collectionFullReadTriggeredThisSession ||
+            isAnotherPlayersCollectionLog())
+        {
+            return;
+        }
+
+        collectionFullReadTriggeredThisSession = true;
+        collectionFullReadPending = true;
+
+        clientThread.invokeLater(this::triggerCollectionLogFullRead);
+    }
+
+    private boolean triggerCollectionLogFullRead()
+    {
+        if (client.getGameState() != GameState.LOGGED_IN ||
+            isAnotherPlayersCollectionLog() ||
+            client.getWidget(InterfaceID.Collection.FRAME) == null)
+        {
+            collectionFullReadTriggeredThisSession = false;
+            collectionFullReadPending = false;
+            return true;
+        }
+
+        Widget searchButton =
+            client.getWidget(InterfaceID.Collection.SEARCH_TOGGLE);
+        if (searchButton == null)
+        {
+            collectionFullReadTriggeredThisSession = false;
+            collectionFullReadPending = false;
+            return true;
+        }
+
+        recordEvent(
+            "collection_log",
+            "collection_log_auto_search_triggered",
+            ImmutableMap.of()
+        );
+
+        // Same approach used by WikiSync/RuneProfile: request the native Search
+        // operation, then re-run the collection-log init script to return the
+        // interface to its normal view. Search causes script 4100 to transmit
+        // every obtained item and quantity.
+        client.menuAction(
+            -1,
+            InterfaceID.Collection.SEARCH_TOGGLE,
+            MenuAction.CC_OP,
+            1,
+            -1,
+            "Search",
+            null
+        );
+        client.runScript(COLLECTION_LOG_INIT_SCRIPT);
+        return true;
+    }
+
+    @Subscribe
     public void onScriptPostFired(ScriptPostFired event)
     {
         int scriptId = event.getScriptId();
+
+        if (scriptId == COLLECTION_LOG_SETUP_SCRIPT)
+        {
+            maybeTriggerCollectionLogFullRead();
+        }
+
         for (int id : COLLECTION_LOG_SCRIPT_IDS)
         {
             if (scriptId == id)
@@ -669,6 +1009,23 @@ public class CharacterStateExporterPlugin extends Plugin
             case "diaries":
                 clientThread.invokeLater(() -> exportDiarySnapshot("manual_command"));
                 return;
+            case "progress":
+            case "progress_flags":
+            case "variables":
+                clientThread.invokeLater(() -> exportProgressFlags("manual_command"));
+                return;
+            case "travel":
+            case "travel_gates":
+            case "unlocks":
+                clientThread.invokeLater(() -> exportTravelGates("manual_command"));
+                return;
+            case "state":
+            case "live":
+            case "slayer":
+            case "ge":
+            case "recurring":
+                clientThread.invokeLater(() -> exportUniversalState("manual_command"));
+                return;
             case "combat":
             case "combat_achievements":
                 clientThread.invokeLater(() -> exportCombatAchievementSnapshot("manual_command"));
@@ -688,6 +1045,9 @@ public class CharacterStateExporterPlugin extends Plugin
                 {
                     exportQuestSnapshot("manual_command");
                     exportDiarySnapshot("manual_command");
+                    exportProgressFlags("manual_command");
+                    exportTravelGates("manual_command");
+                    exportUniversalState("manual_command");
                     exportCombatAchievementSnapshot("manual_command");
                     writeCollectionLogSnapshot("manual_command");
                 });
@@ -709,6 +1069,8 @@ public class CharacterStateExporterPlugin extends Plugin
             return;
         }
 
+        int changedContainerId = event.getContainerId();
+
         for (ContainerKind kind : ContainerKind.values())
         {
             if (!kind.isEnabled(config))
@@ -716,11 +1078,19 @@ public class CharacterStateExporterPlugin extends Plugin
                 continue;
             }
 
-            ItemContainer liveContainer = client.getItemContainer(kind.getInventoryId());
-            if (liveContainer != null && changedContainer == liveContainer)
+            if (changedContainerId == kind.getInventoryId())
             {
-                debug("container_changed", "Matched {} container", kind.getDatasetKey());
-                exportContainerSnapshot(kind, "item_container_changed", kind.getMinimumIntervalMs());
+                debug(
+                    "container_changed",
+                    "Matched {} container id={}",
+                    kind.getDatasetKey(),
+                    changedContainerId
+                );
+                exportContainerSnapshot(
+                    kind,
+                    "item_container_changed",
+                    kind.getMinimumIntervalMs()
+                );
                 return;
             }
         }
@@ -735,12 +1105,42 @@ public class CharacterStateExporterPlugin extends Plugin
         }
 
         String name = sanitizeFileName(player.getName().trim());
-        if (name.equals(currentAccountName))
+        String accountHash = Long.toUnsignedString(client.getAccountHash());
+        if (name.equals(currentAccountName) && accountHash.equals(currentAccountHash))
         {
             return;
         }
 
+        if (currentAccountName != null &&
+            (!name.equals(currentAccountName) || !accountHash.equals(currentAccountHash)))
+        {
+            combatAchievementExporter.clear();
+            diaryWidgetCache.clear();
+            diaryWidgetAreasObservedThisSession.clear();
+            collectionLogCache.clear();
+            collectionWholeLogQuantities.clear();
+            collectionWholeLogDirty = false;
+            collectionWholeLogLastTransmitTick = -1;
+            collectionWholeLogLastObservedAt = null;
+            collectionWholeLogObservedSessionId = null;
+            collectionFullReadTriggeredThisSession = false;
+            collectionFullReadPending = false;
+            dwmsStorageBridge.resetSession();
+            unifiedRebuildQueued.set(false);
+            if (exportStore != null)
+            {
+                exportStore.clearStableCache();
+            }
+            lastExportAt.clear();
+            datasetStatus.clear();
+            synchronized (recentEvents)
+            {
+                recentEvents.clear();
+            }
+        }
+
         currentAccountName = name;
+        currentAccountHash = accountHash;
         Path dir = BASE_OUTPUT_DIR.resolve(name).normalize();
 
         if (!dir.startsWith(BASE_OUTPUT_DIR))
@@ -760,8 +1160,48 @@ public class CharacterStateExporterPlugin extends Plugin
         }
 
         accountOutputDir = dir;
+
+        try
+        {
+            ExportLayout.migrateLegacyFiles(dir);
+            ExportLayout.cleanupRetiredCacheFiles(dir);
+        }
+        catch (IOException ex)
+        {
+            warnOnce(
+                "layout:migrate",
+                "Failed migrating Character Export account layout",
+                ex
+            );
+        }
+
+        if (exportStore != null)
+        {
+            submitWriter(() ->
+            {
+                try
+                {
+                    exportStore.restorePublicViews(dir);
+                }
+                catch (IOException | RuntimeException ex)
+                {
+                    warnOnce(
+                        "public:restore",
+                        "Failed restoring public Character Export views",
+                        ex
+                    );
+                }
+            });
+        }
+
         panel.setAccount(player.getName().trim(), dir);
         panel.restoreFromDisk(dir);
+
+        if (writesEnabled && config.debugLogging())
+        {
+            submitWriter(this::resetExporterLogSync);
+        }
+
         debug("account", "Resolved account directory for {}", name);
     }
 
@@ -1001,11 +1441,15 @@ public class CharacterStateExporterPlugin extends Plugin
                 {
                     // Karamja Easy/Medium/Hard have individual per-task varbits
                     tierData.put("tasks", buildKaramjaTaskList(t));
+                    tierData.put("tasks_source", "game_varbit");
+                    tierData.put("tasks_current_session", true);
                 }
                 else if (widgetAreaData != null && widgetAreaData.containsKey(tierName))
                 {
-                    // Widget-scraped when player opened the diary journal
+                    boolean currentSession = diaryWidgetAreasObservedThisSession.contains(areaName);
                     tierData.put("tasks", widgetAreaData.get(tierName));
+                    tierData.put("tasks_source", currentSession ? "widget_current_session" : "persisted_widget_cache");
+                    tierData.put("tasks_current_session", currentSession);
                 }
 
                 tierMap.put(tierName, tierData);
@@ -1022,7 +1466,7 @@ public class CharacterStateExporterPlugin extends Plugin
         payload.put("summary", ImmutableMap.of(
             "tiers_complete", tiersComplete,
             "tiers_possible", tiersPossible,
-            "note", "tasks_done counts are always available; named task lists require opening the diary journal in-game"
+            "note", "tasks_done/tier completion are live game vars. Named widget task lists carry source/freshness metadata; progress_flags.json exposes raw diary vars without opening the journal."
         ));
         payload.put("diaries", diaries);
 
@@ -1065,165 +1509,284 @@ public class CharacterStateExporterPlugin extends Plugin
         return tasks;
     }
 
+    private void exportProgressFlags(String reason)
+    {
+        exportProgressFlags(reason, 0L);
+    }
+
+    private void exportProgressFlags(String reason, long minimumIntervalMs)
+    {
+        if (!config.exportRawVariables() ||
+            client.getGameState() != GameState.LOGGED_IN)
+        {
+            if (isManualPanelReason(reason))
+            {
+                panel.markUnavailable(
+                    "progress_flags",
+                    "Disabled",
+                    "Game variable export is disabled in plugin settings."
+                );
+            }
+            return;
+        }
+
+        if (!acquireExportSlot(PROGRESS_FLAGS_FILE, minimumIntervalMs))
+        {
+            return;
+        }
+
+        Map<String, Object> payload = basePayload(reason);
+        payload.putAll(ProgressFlagExporter.snapshot(
+            client,
+            BASE_OUTPUT_DIR.resolve(PROGRESS_MANIFEST_FILE)
+        ));
+
+        updateDatasetStatus("progress_flags", "prepared", "ready_to_write", ImmutableMap.of(
+            "reason", reason,
+            "varbit_count", payload.get("varbit_count"),
+            "varplayer_count", payload.get("varplayer_count")
+        ));
+        writeJson("progress_flags", PROGRESS_FLAGS_FILE, payload);
+    }
+
+    private void exportTravelGates(String reason)
+    {
+        exportTravelGates(reason, 0L);
+    }
+
+    private void exportTravelGates(String reason, long minimumIntervalMs)
+    {
+        if (!config.exportTravelState() ||
+            client.getGameState() != GameState.LOGGED_IN)
+        {
+            if (isManualPanelReason(reason))
+            {
+                panel.markUnavailable(
+                    "travel_gates",
+                    "Disabled",
+                    "Travel-state export is disabled in plugin settings."
+                );
+            }
+            return;
+        }
+
+        if (!acquireExportSlot(TRAVEL_GATES_FILE, minimumIntervalMs))
+        {
+            if (isManualPanelReason(reason))
+            {
+                panel.markChecked("travel_gates");
+            }
+            return;
+        }
+
+        Map<String, Object> payload = basePayload(reason);
+        payload.putAll(TravelGateExporter.snapshot(client));
+
+        updateDatasetStatus(
+            "travel_gates",
+            "prepared",
+            "ready_to_write",
+            ImmutableMap.of(
+                "reason", reason,
+                "gate_count", payload.get("gate_count"),
+                "satisfied_count", payload.get("satisfied_count")
+            )
+        );
+        writeJson("travel_gates", TRAVEL_GATES_FILE, payload);
+    }
+
+    private void exportUniversalState(String reason)
+    {
+        exportUniversalState(reason, 0L);
+    }
+
+    private void exportUniversalState(String reason, long minimumIntervalMs)
+    {
+        if (!config.exportUniversalState() ||
+            client.getGameState() != GameState.LOGGED_IN)
+        {
+            if (isManualPanelReason(reason))
+            {
+                String tooltip =
+                    "Live & activities export is disabled in plugin settings.";
+                panel.markUnavailable(
+                    ExportDataset.STATE.key(),
+                    "Disabled",
+                    tooltip
+                );
+                panel.markUnavailable(
+                    ExportDataset.LIVE.key(),
+                    "Disabled",
+                    tooltip
+                );
+            }
+            return;
+        }
+
+        if (!acquireExportSlot(STATE_FILE, minimumIntervalMs))
+        {
+            if (isManualPanelReason(reason))
+            {
+                panel.markChecked("state");
+            }
+            return;
+        }
+
+        Map<String, Object> direct =
+            UniversalStateExporter.snapshot(client, itemManager);
+
+        Map<String, Object> semantic = basePayload(reason);
+        semantic.put("slayer", direct.get("slayer"));
+        semantic.put("grand_exchange", direct.get("grand_exchange"));
+        semantic.put("recurring", direct.get("recurring"));
+
+        updateDatasetStatus(
+            "state",
+            "prepared",
+            "ready_to_write",
+            ImmutableMap.of("reason", reason)
+        );
+        writeJson("state", STATE_FILE, semantic);
+
+        Map<String, Object> livePayload = basePayload(reason);
+        livePayload.put("live", direct.get("live"));
+        writeJson(ExportDataset.LIVE.key(), LIVE_FILE, livePayload);
+    }
     private void exportCombatAchievementSnapshot(String reason)
     {
         exportCombatAchievementSnapshot(reason, 0L);
     }
 
-    private void exportCombatAchievementSnapshot(String reason, long minimumIntervalMs)
+    private void exportCombatAchievementSnapshot(
+        String reason,
+        long minimumIntervalMs)
     {
-        boolean manualPanelRequest = isManualPanelReason(reason);
+        boolean manualPanelRequest =
+            isManualPanelReason(reason);
         GameState gameState = client.getGameState();
-        if (!config.exportCombatAchievements() || gameState != GameState.LOGGED_IN)
+
+        if (!config.exportCombatAchievements() ||
+            gameState != GameState.LOGGED_IN)
         {
-            debug("combat_achievements", "Skipped combat achievement export reason={} enabled={} gameState={}",
-                reason, config.exportCombatAchievements(), gameState);
-            updateDatasetStatus("combat_achievements", "skipped", "not_logged_in_or_disabled", ImmutableMap.of(
-                "reason", reason, "enabled", config.exportCombatAchievements(), "game_state", gameState.name()
-            ));
+            debug(
+                "combat_achievements",
+                "Skipped combat achievement export reason={} enabled={} gameState={}",
+                reason,
+                config.exportCombatAchievements(),
+                gameState
+            );
+
+            updateDatasetStatus(
+                "combat_achievements",
+                "skipped",
+                "not_logged_in_or_disabled",
+                ImmutableMap.of(
+                    "reason",
+                    reason,
+                    "enabled",
+                    config.exportCombatAchievements(),
+                    "game_state",
+                    gameState.name()
+                )
+            );
+
             if (manualPanelRequest)
             {
-                panel.markUnavailable("combat_achievements", "Not ready", "Combat achievements are only available while logged in.");
+                panel.markUnavailable(
+                    "combat_achievements",
+                    "Not ready",
+                    "Combat achievements are only available while logged in."
+                );
             }
+
             requestObservabilityWrite(false);
             return;
         }
 
-        if (!acquireExportSlot(COMBAT_ACHIEVEMENTS_FILE, minimumIntervalMs))
+        if (!acquireExportSlot(
+            COMBAT_ACHIEVEMENTS_FILE,
+            minimumIntervalMs))
         {
-            debug("combat_achievements", "Throttled combat achievement export reason={} minimumIntervalMs={}",
-                reason, minimumIntervalMs);
-            updateDatasetStatus("combat_achievements", "throttled", "minimum_interval", ImmutableMap.of(
-                "reason", reason, "minimum_interval_ms", minimumIntervalMs
-            ));
+            updateDatasetStatus(
+                "combat_achievements",
+                "throttled",
+                "minimum_interval",
+                ImmutableMap.of(
+                    "reason",
+                    reason,
+                    "minimum_interval_ms",
+                    minimumIntervalMs
+                )
+            );
+
             if (manualPanelRequest)
             {
                 panel.markChecked("combat_achievements");
             }
+
             requestObservabilityWrite(false);
             return;
         }
 
-        // Ensure task cache is loaded (may not be if plugin was hot-loaded mid-session)
-        if (combatTaskCache.isEmpty())
-        {
-            loadCombatTaskCache();
-        }
-
-        // Build per-tier task lists
-        Map<String, List<Map<String, Object>>> tierTaskLists = new LinkedHashMap<>();
-        for (String tier : CA_TIER_NAMES)
-        {
-            tierTaskLists.put(tier, new ArrayList<>());
-        }
-
-        for (CombatTask task : combatTaskCache)
-        {
-            if (task.tier < 1 || task.tier > CA_TIER_NAMES.length)
-            {
-                continue;
-            }
-            String tierName = CA_TIER_NAMES[task.tier - 1];
-
-            int varpIndex = task.id / 32;
-            boolean complete = false;
-            if (varpIndex < COMBAT_TASK_VARPS.length)
-            {
-                int varpValue = client.getVarpValue(COMBAT_TASK_VARPS[varpIndex]);
-                complete = isCombatTaskComplete(task.id, varpValue);
-            }
-
-            Map<String, Object> taskRow = new LinkedHashMap<>();
-            taskRow.put("id", task.id);
-            taskRow.put("name", task.name);
-            taskRow.put("complete", complete);
-            tierTaskLists.get(tierName).add(taskRow);
-        }
-
-        Map<String, Object> tiers = new LinkedHashMap<>();
-        int totalTasksDone = 0;
-        int totalTiersComplete = 0;
-
-        for (int i = 0; i < CA_TIER_NAMES.length; i++)
-        {
-            String tierName = CA_TIER_NAMES[i];
-            boolean tierComplete = client.getVarbitValue(CA_TIER_COMPLETE_VARBITS[i]) == 1;
-            List<Map<String, Object>> tasks = tierTaskLists.get(tierName);
-
-            int tierTasksDone = 0;
-            for (Map<String, Object> t : tasks)
-            {
-                if (Boolean.TRUE.equals(t.get("complete")))
-                {
-                    tierTasksDone++;
-                }
-            }
-            totalTasksDone += tierTasksDone;
-
-            Map<String, Object> tier = new LinkedHashMap<>();
-            tier.put("complete", tierComplete);
-            tier.put("tasks_completed", tierTasksDone);
-            tier.put("tasks_total", tasks.size());
-            tier.put("tasks", tasks);
-            tiers.put(tierName, tier);
-
-            if (tierComplete)
-            {
-                totalTiersComplete++;
-            }
-        }
-
-        // If cache is empty (struct loading failed), fall back to varbit counts
-        boolean namedDataAvailable = !combatTaskCache.isEmpty();
+        Map<String, Object> snapshot =
+            combatAchievementExporter.snapshot(client);
 
         Map<String, Object> payload = basePayload(reason);
-        payload.put("summary", ImmutableMap.of(
-            "total_tasks_completed", totalTasksDone,
-            "total_tiers_completed", totalTiersComplete,
-            "named_data_available", namedDataAvailable
-        ));
-        payload.put("tiers", tiers);
+        payload.putAll(snapshot);
 
-        debug("combat_achievements", "Prepared combat achievement export reason={} tasks={} tiersComplete={} named={}",
-            reason, totalTasksDone, totalTiersComplete, namedDataAvailable);
-        updateDatasetStatus("combat_achievements", "prepared", "ready_to_write", ImmutableMap.of(
-            "reason", reason, "total_tasks_completed", totalTasksDone, "total_tiers_completed", totalTiersComplete
-        ));
-        writeJson("combat_achievements", COMBAT_ACHIEVEMENTS_FILE, payload);
-    }
+        Object summaryObject = snapshot.get("summary");
+        Map<?, ?> summary =
+            summaryObject instanceof Map
+                ? (Map<?, ?>) summaryObject
+                : java.util.Collections.emptyMap();
 
-    static boolean isCombatTaskComplete(int taskId, int varpValue)
-    {
-        return (varpValue & (1 << (taskId % 32))) != 0;
+        Object completed =
+            summary.get("total_tasks_completed");
+        Object tiersCompleted =
+            summary.get("total_tiers_completed");
+        Object catalogueTasks =
+            summary.get("catalogue_tasks");
+
+        debug(
+            "combat_achievements",
+            "Prepared combat achievement export reason={} catalogue={} tasks={} tiersComplete={}",
+            reason,
+            catalogueTasks,
+            completed,
+            tiersCompleted
+        );
+
+        updateDatasetStatus(
+            "combat_achievements",
+            "prepared",
+            "ready_to_write",
+            ImmutableMap.of(
+                "reason",
+                reason,
+                "catalogue_tasks",
+                catalogueTasks == null ? 0 : catalogueTasks,
+                "total_tasks_completed",
+                completed == null ? 0 : completed,
+                "total_tiers_completed",
+                tiersCompleted == null ? 0 : tiersCompleted
+            )
+        );
+
+        writeJson(
+            "combat_achievements",
+            COMBAT_ACHIEVEMENTS_FILE,
+            payload
+        );
     }
 
     private void loadCombatTaskCache()
     {
-        combatTaskCache.clear();
-        int loaded = 0;
-        for (int sortId = 0; sortId < COMBAT_STRUCT_IDS.length; sortId++)
-        {
-            int structId = COMBAT_STRUCT_IDS[sortId];
-            StructComposition struct = client.getStructComposition(structId);
-            if (struct == null)
-            {
-                continue;
-            }
-            String name = struct.getStringValue(CA_PARAM_NAME);
-            if (name == null || name.isEmpty())
-            {
-                name = "Task " + sortId;
-            }
-            int id = struct.getIntValue(CA_PARAM_ID);
-            int tier = struct.getIntValue(CA_PARAM_TIER);
-            if (tier < 1 || tier > CA_TIER_NAMES.length)
-            {
-                tier = 1;
-            }
-            combatTaskCache.add(new CombatTask(id, name, tier));
-            loaded++;
-        }
-        debug("combat", "Loaded {} / {} combat tasks from game cache", loaded, COMBAT_STRUCT_IDS.length);
+        int loaded = combatAchievementExporter.reload(client);
+        debug(
+            "combat",
+            "Loaded {} Combat Achievement tasks from live game-cache tier enums",
+            loaded
+        );
     }
 
     private void scrapeDiaryJournal()
@@ -1308,9 +1871,9 @@ public class CharacterStateExporterPlugin extends Plugin
                 continue;
             }
 
-            for (DiaryWidgetLine line : splitDiaryWidgetLines(raw))
+            for (DiaryWidgetParser.Line line : DiaryWidgetParser.splitLines(raw))
             {
-                String clean = line.getText();
+                String clean = line.text();
                 if (clean.isEmpty())
                 {
                     continue;
@@ -1363,7 +1926,7 @@ public class CharacterStateExporterPlugin extends Plugin
 
                 if (currentTier != null)
                 {
-                    appendDiaryTaskLine(tierTasks.get(currentTier), clean, line.isComplete());
+                    DiaryWidgetParser.appendTaskLine(tierTasks.get(currentTier), clean, line.complete());
                 }
             }
         }
@@ -1381,128 +1944,14 @@ public class CharacterStateExporterPlugin extends Plugin
         if (!filtered.isEmpty())
         {
             diaryWidgetCache.put(areaName, filtered);
+            diaryWidgetAreasObservedThisSession.add(areaName);
             debug("diaries", "Scraped diary journal for {} — {} tiers with tasks", areaName, filtered.size());
             exportDiarySnapshot("diary_journal_scraped", DIARY_EXPORT_INTERVAL_MS);
         }
     }
 
-    static void appendDiaryTaskLine(List<Map<String, Object>> tasks, String clean, boolean complete)
-    {
-        if (shouldSkipDiaryTaskLine(clean))
-        {
-            return;
-        }
-
-        DiaryContinuationKind continuationKind = classifyDiaryContinuation(tasks, clean);
-        if (continuationKind != DiaryContinuationKind.NONE)
-        {
-            Map<String, Object> previousTask = tasks.get(tasks.size() - 1);
-            String previousName = String.valueOf(previousTask.get("name"));
-            previousTask.put("name", joinDiaryTaskText(previousName, clean));
-            if (continuationKind == DiaryContinuationKind.TEXT && complete)
-            {
-                previousTask.put("complete", true);
-            }
-            return;
-        }
-
-        Map<String, Object> task = new LinkedHashMap<>();
-        task.put("name", clean);
-        task.put("complete", complete);
-        tasks.add(task);
-    }
-
-    private static boolean shouldSkipDiaryTaskLine(String clean)
-    {
-        String normalized = clean.trim().toLowerCase();
-        return normalized.startsWith("if i ever lose my ");
-    }
-
-    private static DiaryContinuationKind classifyDiaryContinuation(List<Map<String, Object>> tasks, String clean)
-    {
-        if (tasks.isEmpty() || clean.isEmpty())
-        {
-            return DiaryContinuationKind.NONE;
-        }
-
-        if (clean.startsWith("("))
-        {
-            return DiaryContinuationKind.REQUIREMENT;
-        }
-
-        char first = clean.charAt(0);
-        if (Character.isLowerCase(first) || isInlinePunctuation(first))
-        {
-            return DiaryContinuationKind.TEXT;
-        }
-
-        String previousName = String.valueOf(tasks.get(tasks.size() - 1).get("name"));
-        if (!endsDiarySentence(previousName))
-        {
-            return DiaryContinuationKind.TEXT;
-        }
-
-        return DiaryContinuationKind.NONE;
-    }
-
-    private static String joinDiaryTaskText(String previous, String continuation)
-    {
-        if (previous.isEmpty())
-        {
-            return continuation;
-        }
-
-        if (continuation.isEmpty())
-        {
-            return previous;
-        }
-
-        if (isInlinePunctuation(continuation.charAt(0)))
-        {
-            return previous + continuation;
-        }
-
-        return previous + " " + continuation;
-    }
-
-    private static boolean endsDiarySentence(String text)
-    {
-        if (text == null || text.isEmpty())
-        {
-            return false;
-        }
-
-        char last = text.charAt(text.length() - 1);
-        return last == '.' || last == '!' || last == '?' || last == ')';
-    }
-
-    private static boolean isInlinePunctuation(char c)
-    {
-        return c == '.' || c == ',' || c == ';' || c == ':' || c == ')' || c == ']' || c == '}';
-    }
-
-    static List<DiaryWidgetLine> splitDiaryWidgetLines(String raw)
-    {
-        if (raw == null || raw.isEmpty())
-        {
-            return List.of();
-        }
-
-        String normalized = raw.replace('\r', '\n');
-
-        List<DiaryWidgetLine> lines = new ArrayList<>();
-        for (String part : normalized.split("(?i)<br\\s*/?>"))
-        {
-            String clean = stripWidgetTags(part).trim();
-            if (!clean.isEmpty())
-            {
-                lines.add(new DiaryWidgetLine(clean, part.toLowerCase().contains("<str>")));
-            }
-        }
-        return lines;
-    }
-
     private void scrapeCollectionLogPage()
+
     {
         if (!config.exportCollectionLog() || client.getGameState() != GameState.LOGGED_IN)
         {
@@ -1685,12 +2134,17 @@ public class CharacterStateExporterPlugin extends Plugin
             return;
         }
 
-        if (collectionLogCache.isEmpty())
+        if (collectionLogCache.isEmpty() &&
+            collectionWholeLogQuantities.isEmpty() &&
+            collectionWholeLogLastObservedAt == null)
         {
-            // Nothing scraped yet — don't write an empty file or consume the throttle slot
             if (manualPanelRequest)
             {
-                panel.markUnavailable("collection_log", "Open log", "Open the Collection Log in-game and click each entry to capture it.");
+                panel.markUnavailable(
+                    "collection_log",
+                    "Open log once",
+                    "Open your own Collection Log once; Character Export will sync it automatically."
+                );
             }
             return;
         }
@@ -1723,16 +2177,60 @@ public class CharacterStateExporterPlugin extends Plugin
             tabMap.put(entryName, data);
         }
 
+        List<Map<String, Object>> wholeOwnedItems = new ArrayList<>();
+        collectionWholeLogQuantities.entrySet().stream()
+            .sorted(Map.Entry.comparingByKey())
+            .forEach(entry ->
+            {
+                Map<String, Object> item = new LinkedHashMap<>();
+                item.put("id", entry.getKey());
+                item.put("name", safeItemName(entry.getKey()));
+                item.put("quantity", entry.getValue());
+                wholeOwnedItems.add(item);
+            });
+
+        Map<String, Object> wholeLog = new LinkedHashMap<>();
+        wholeLog.put(
+            "source",
+            "native_collection_log_search_transmission"
+        );
+        wholeLog.put(
+            "snapshot_observed",
+            collectionWholeLogLastObservedAt != null
+        );
+        wholeLog.put(
+            "last_observed_at",
+            collectionWholeLogLastObservedAt
+        );
+        wholeLog.put(
+            "observed_session_id",
+            collectionWholeLogObservedSessionId
+        );
+        wholeLog.put(
+            "owned_item_types",
+            wholeOwnedItems.size()
+        );
+        wholeLog.put(
+            "owned_items",
+            wholeOwnedItems
+        );
+
         Map<String, Object> payload = basePayload(reason);
         payload.put("entries_scraped", collectionLogCache.size());
-        payload.put("note", "Open each collection log page in-game to capture it. Data accumulates across sessions.");
+        payload.put("whole_log", wholeLog);
+        payload.put(
+            "note",
+            "Open your own Collection Log once to reconcile the whole owned-item snapshot automatically. " +
+            "New unlocks are merged while RuneLite is running; page scrapes remain supplemental metadata."
+        );
         payload.put("tabs", tabs);
 
         debug("collection_log", "Writing collection log snapshot reason={} entries={}", reason, collectionLogCache.size());
         writeJson("collection_log", COLLECTION_LOG_FILE, payload);
     }
 
-    private void restoreCollectionLogCache()
+    @SuppressWarnings("unchecked")
+    private void restoreDiaryWidgetCache()
     {
         Path dir = accountOutputDir;
         if (dir == null)
@@ -1740,7 +2238,131 @@ public class CharacterStateExporterPlugin extends Plugin
             return;
         }
 
-        Path file = dir.resolve(COLLECTION_LOG_FILE);
+        Path file = ExportLayout.datasetPath(dir, ExportDataset.DIARIES);
+        if (!Files.isRegularFile(file))
+        {
+            return;
+        }
+
+        try
+        {
+            String raw = Files.readString(file, StandardCharsets.UTF_8);
+            Map<String, Object> root = gson.fromJson(raw, Map.class);
+            Object versionObject = root.get("plugin_version");
+            String version = versionObject != null ? String.valueOf(versionObject) : "";
+
+            // Never import the original 0.6.0 widget completions. Its parser
+            // treated struck-through requirement text as whole-task completion.
+            // All later fork/refactor versions use the corrected parser.
+            if (version.startsWith("0.6.0"))
+            {
+                debug(
+                    "diaries",
+                    "Ignored unsafe legacy diary cache from plugin_version={}",
+                    version
+                );
+                return;
+            }
+
+            Object diariesObject = root.get("diaries");
+            if (!(diariesObject instanceof Map))
+            {
+                return;
+            }
+
+            Map<?, ?> diaries = (Map<?, ?>) diariesObject;
+            int restoredAreas = 0;
+
+            for (Map.Entry<?, ?> areaEntry : diaries.entrySet())
+            {
+                if (!(areaEntry.getKey() instanceof String) ||
+                    !(areaEntry.getValue() instanceof Map))
+                {
+                    continue;
+                }
+
+                String areaName = (String) areaEntry.getKey();
+                Map<?, ?> tiers = (Map<?, ?>) areaEntry.getValue();
+                Map<String, List<Map<String, Object>>> restoredTiers =
+                    new LinkedHashMap<>();
+
+                for (Map.Entry<?, ?> tierEntry : tiers.entrySet())
+                {
+                    if (!(tierEntry.getKey() instanceof String) ||
+                        !(tierEntry.getValue() instanceof Map))
+                    {
+                        continue;
+                    }
+
+                    Map<?, ?> tierData = (Map<?, ?>) tierEntry.getValue();
+                    Object tasksObject = tierData.get("tasks");
+                    String source = tierData.get("tasks_source") != null
+                        ? String.valueOf(tierData.get("tasks_source"))
+                        : "";
+
+                    if (!(tasksObject instanceof List) || "game_varbit".equals(source))
+                    {
+                        continue;
+                    }
+
+                    List<Map<String, Object>> restoredTasks = new ArrayList<>();
+                    for (Object rowObject : (List<?>) tasksObject)
+                    {
+                        if (!(rowObject instanceof Map))
+                        {
+                            continue;
+                        }
+
+                        Map<?, ?> row = (Map<?, ?>) rowObject;
+                        Object nameObject = row.get("name");
+                        if (!(nameObject instanceof String))
+                        {
+                            continue;
+                        }
+
+                        Map<String, Object> task = new LinkedHashMap<>();
+                        task.put("name", nameObject);
+                        task.put("complete", Boolean.TRUE.equals(row.get("complete")));
+                        restoredTasks.add(task);
+                    }
+
+                    if (!restoredTasks.isEmpty())
+                    {
+                        restoredTiers.put(
+                            (String) tierEntry.getKey(),
+                            restoredTasks
+                        );
+                    }
+                }
+
+                if (!restoredTiers.isEmpty())
+                {
+                    diaryWidgetCache.put(areaName, restoredTiers);
+                    restoredAreas++;
+                }
+            }
+
+            debug("diaries",
+                "Restored persisted fork diary cache for {} areas",
+                restoredAreas);
+        }
+        catch (Exception ex)
+        {
+            debug("diaries",
+                "Could not restore persisted diary cache: {}",
+                ex.toString());
+        }
+    }
+    private void restoreCollectionLogCache()
+
+    {
+        Path dir = accountOutputDir;
+        if (dir == null)
+        {
+            return;
+        }
+
+        Path file = ExportLayout.datasetPath(dir, ExportDataset.COLLECTION_LOG);
         if (!Files.isRegularFile(file))
         {
             return;
@@ -1757,34 +2379,92 @@ public class CharacterStateExporterPlugin extends Plugin
             }
 
             Object tabsObj = saved.get("tabs");
-            if (!(tabsObj instanceof Map))
-            {
-                return;
-            }
-
-            @SuppressWarnings("unchecked")
-            Map<String, Object> savedTabs = (Map<String, Object>) tabsObj;
             int restored = 0;
-            for (Map.Entry<String, Object> tabEntry : savedTabs.entrySet())
+            if (tabsObj instanceof Map)
             {
-                if (!(tabEntry.getValue() instanceof Map))
-                {
-                    continue;
-                }
                 @SuppressWarnings("unchecked")
-                Map<String, Object> entries = (Map<String, Object>) tabEntry.getValue();
-                for (Map.Entry<String, Object> entry : entries.entrySet())
+                Map<String, Object> savedTabs =
+                    (Map<String, Object>) tabsObj;
+                for (Map.Entry<String, Object> tabEntry :
+                    savedTabs.entrySet())
                 {
-                    if (entry.getValue() instanceof Map)
+                    if (!(tabEntry.getValue() instanceof Map))
                     {
-                        @SuppressWarnings("unchecked")
-                        Map<String, Object> entryData = (Map<String, Object>) entry.getValue();
-                        collectionLogCache.put(entry.getKey(), entryData);
-                        restored++;
+                        continue;
+                    }
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object> entries =
+                        (Map<String, Object>) tabEntry.getValue();
+                    for (Map.Entry<String, Object> entry :
+                        entries.entrySet())
+                    {
+                        if (entry.getValue() instanceof Map)
+                        {
+                            @SuppressWarnings("unchecked")
+                            Map<String, Object> entryData =
+                                (Map<String, Object>) entry.getValue();
+                            collectionLogCache.put(
+                                entry.getKey(),
+                                entryData
+                            );
+                            restored++;
+                        }
                     }
                 }
             }
-            debug("collection_log", "Restored {} collection log entries from disk", restored);
+            Object wholeLogObj = saved.get("whole_log");
+            if (wholeLogObj instanceof Map)
+            {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> wholeLog =
+                    (Map<String, Object>) wholeLogObj;
+
+                Object observedAt = wholeLog.get("last_observed_at");
+                if (observedAt != null)
+                {
+                    collectionWholeLogLastObservedAt =
+                        String.valueOf(observedAt);
+                }
+
+                Object observedSessionId =
+                    wholeLog.get("observed_session_id");
+                if (observedSessionId != null)
+                {
+                    collectionWholeLogObservedSessionId =
+                        String.valueOf(observedSessionId);
+                }
+
+                Object ownedItemsObj = wholeLog.get("owned_items");
+                if (ownedItemsObj instanceof List)
+                {
+                    for (Object rowObj : (List<?>) ownedItemsObj)
+                    {
+                        if (!(rowObj instanceof Map))
+                        {
+                            continue;
+                        }
+
+                        Map<?, ?> row = (Map<?, ?>) rowObj;
+                        Object idObj = row.get("id");
+                        Object quantityObj = row.get("quantity");
+                        if (idObj instanceof Number &&
+                            quantityObj instanceof Number)
+                        {
+                            collectionWholeLogQuantities.put(
+                                ((Number) idObj).intValue(),
+                                ((Number) quantityObj).intValue()
+                            );
+                        }
+                    }
+                }
+            }
+
+            debug(
+                "collection_log",
+                "Restored {} page entries and {} whole-log owned item types from disk",
+                restored,
+                collectionWholeLogQuantities.size()
+            );
         }
         catch (Exception ex)
         {
@@ -1871,21 +2551,55 @@ public class CharacterStateExporterPlugin extends Plugin
         }
 
         List<Map<String, Object>> items = new ArrayList<>();
+        List<Map<String, Object>> placeholders = new ArrayList<>();
         Item[] containerItems = container.getItems();
         for (int slot = 0; slot < containerItems.length; slot++)
         {
             Item item = containerItems[slot];
-            if (item == null || item.getId() <= 0 || item.getQuantity() <= 0)
+            if (item == null || item.getId() <= 0)
             {
                 continue;
             }
 
-            int canonicalId = itemManager.canonicalize(item.getId());
+            int rawItemId = item.getId();
+            if (kind == ContainerKind.BANK &&
+                rawItemId == ItemID.BANK_FILLER)
+            {
+                continue;
+            }
+
+            boolean bankPlaceholder =
+                kind == ContainerKind.BANK && isBankPlaceholder(rawItemId);
+
+            if (bankPlaceholder)
+            {
+                int canonicalId = itemManager.canonicalize(rawItemId);
+                Map<String, Object> row = new LinkedHashMap<>();
+                row.put("slot", slot);
+                row.put("id", canonicalId);
+                row.put("raw_id", rawItemId);
+                row.put("quantity", 0);
+                row.put("name", safeItemName(canonicalId));
+                row.put("item_state", "placeholder");
+                placeholders.add(row);
+                continue;
+            }
+
+            if (item.getQuantity() <= 0)
+            {
+                continue;
+            }
+
+            int canonicalId = itemManager.canonicalize(rawItemId);
             Map<String, Object> row = new LinkedHashMap<>();
             row.put("slot", slot);
             row.put("id", canonicalId);
             row.put("quantity", item.getQuantity());
             row.put("name", safeItemName(canonicalId));
+            if (kind == ContainerKind.BANK)
+            {
+                row.put("item_state", "owned");
+            }
             items.add(row);
         }
 
@@ -1893,6 +2607,16 @@ public class CharacterStateExporterPlugin extends Plugin
         payload.put("kind", kind.getDatasetKey());
         payload.put("item_count", items.size());
         payload.put("items", items);
+        if (kind == ContainerKind.BANK)
+        {
+            Map<String, Object> semantics = new LinkedHashMap<>();
+            semantics.put("items", "owned");
+            semantics.put("placeholders", "not_owned");
+            semantics.put("quantity", "owned_quantity");
+            payload.put("item_semantics", semantics);
+            payload.put("placeholder_count", placeholders.size());
+            payload.put("placeholders", placeholders);
+        }
 
         debug(kind.getDatasetKey(), "Prepared {} export reason={} itemCount={}",
             kind.getDatasetKey(), reason, items.size());
@@ -1962,7 +2686,27 @@ public class CharacterStateExporterPlugin extends Plugin
         return worldTypes;
     }
 
+    private boolean isBankPlaceholder(int itemId)
+    {
+        try
+        {
+            ItemComposition composition = itemManager.getItemComposition(itemId);
+            return composition != null &&
+                composition.getPlaceholderTemplateId() != -1;
+        }
+        catch (RuntimeException ex)
+        {
+            debug(
+                "bank",
+                "Could not inspect placeholder state for item id={} error={}",
+                itemId,
+                ex.toString()
+            );
+            return false;
+        }
+    }
     private String safeItemName(int canonicalId)
+
     {
         try
         {
@@ -2002,76 +2746,197 @@ public class CharacterStateExporterPlugin extends Plugin
         return true;
     }
 
-    private void writeJson(String datasetKey, String fileName, Map<String, Object> payload)
+    private void writeJson(
+        String datasetKey,
+        String fileName,
+        Map<String, Object> payload)
     {
         Path outputDir = accountOutputDir;
-        if (!writesEnabled || outputDir == null)
+        ExportDataset dataset =
+            ExportDataset.fromKey(datasetKey);
+
+        if (!writesEnabled ||
+            outputDir == null ||
+            exportStore == null ||
+            dataset == null)
         {
-            updateDatasetStatus(datasetKey, "error", "writes_disabled", ImmutableMap.of("file", fileName));
+            updateDatasetStatus(
+                datasetKey,
+                "error",
+                "writes_disabled_or_unknown_dataset",
+                ImmutableMap.of("file", fileName)
+            );
             requestObservabilityWrite(false);
             return;
         }
 
-        String json = serializePayload(fileName, payload);
-        String stableJson = stableJson(payload);
-        if (json == null || stableJson == null)
+        if (!dataset.fragmentFileName().equals(fileName))
         {
-            updateDatasetStatus(datasetKey, "error", "serialization_failed", ImmutableMap.of("file", fileName));
+            updateDatasetStatus(
+                datasetKey,
+                "error",
+                "dataset_file_mismatch",
+                ImmutableMap.of(
+                    "expected",
+                    dataset.fragmentFileName(),
+                    "actual",
+                    fileName
+                )
+            );
             requestObservabilityWrite(false);
             return;
         }
 
-        Path outputPath = outputDir.resolve(fileName);
-        boolean manualRequest = isManualPanelRequest(payload);
+        boolean manualRequest =
+            isManualPanelRequest(payload);
+
         submitWriter(() ->
         {
             try
             {
-                String previousStable = lastStablePayloadByFile.get(fileName);
-                if (stableJson.equals(previousStable))
+                ExportStore.WriteResult result =
+                    exportStore.writeDataset(
+                        outputDir,
+                        dataset,
+                        payload
+                    );
+
+                if (result == ExportStore.WriteResult.UNCHANGED)
                 {
-                    debug("writer", "Skipped write for {} because stable payload is unchanged", outputPath);
-                    updateDatasetStatus(datasetKey, "unchanged", "stable_payload_unchanged", ImmutableMap.of(
-                        "file", fileName
-                    ));
-                    if (manualRequest)
+                    debug(
+                        "writer",
+                        "Skipped unchanged dataset {}",
+                        dataset.key()
+                    );
+
+                    updateDatasetStatus(
+                        datasetKey,
+                        "unchanged",
+                        "stable_payload_unchanged",
+                        ImmutableMap.of("file", fileName)
+                    );
+
+                    if (manualRequest ||
+                        dataset.interactionBacked())
                     {
                         panel.markChecked(datasetKey);
                     }
+
                     requestObservabilityWrite(false);
                     return;
                 }
 
-                writeTextFileSync(outputPath, json + System.lineSeparator());
-                lastStablePayloadByFile.put(fileName, stableJson);
-                warnedFailureKeys.remove("write:" + fileName);
+                // A fragment is independently durable once its atomic write
+                // succeeds. Rebuild aggregate views only for datasets they can
+                // consume; live.json is intentionally high-churn and already
+                // has its own direct public mirror.
+                if (dataset != ExportDataset.LIVE)
+                {
+                    queueDerivedViewRebuild(outputDir);
+                }
 
-                debug("writer", "Wrote export file {}", outputPath);
-                updateDatasetStatus(datasetKey, "success", "write_complete", ImmutableMap.of(
-                    "file", fileName
-                ));
-                recordEvent("writer", "write_complete", ImmutableMap.of(
-                    "file", fileName
-                ));
+                warnedFailureKeys.remove(
+                    "write:" + fileName
+                );
+
+                updateDatasetStatus(
+                    datasetKey,
+                    "success",
+                    "write_complete",
+                    ImmutableMap.of("file", fileName)
+                );
+
+                recordEvent(
+                    "writer",
+                    "write_complete",
+                    ImmutableMap.of("file", fileName)
+                );
+
                 panel.markExported(datasetKey);
                 requestObservabilityWrite(false);
             }
-            catch (IOException ex)
+            catch (IOException | RuntimeException ex)
             {
-                updateDatasetStatus(datasetKey, "error", "write_failed", ImmutableMap.of(
-                    "file", fileName,
-                    "error", ex.toString()
-                ));
-                recordEvent("writer", "write_failed", ImmutableMap.of(
-                    "file", fileName,
-                    "error", ex.toString()
-                ));
+                updateDatasetStatus(
+                    datasetKey,
+                    "error",
+                    "write_failed",
+                    ImmutableMap.of(
+                        "file",
+                        fileName,
+                        "error",
+                        ex.toString()
+                    )
+                );
+
+                recordEvent(
+                    "writer",
+                    "write_failed",
+                    ImmutableMap.of(
+                        "file",
+                        fileName,
+                        "error",
+                        ex.toString()
+                    )
+                );
+
                 if (manualRequest)
                 {
-                    panel.markFailed(datasetKey, ex.toString());
+                    panel.markFailed(
+                        datasetKey,
+                        ex.toString()
+                    );
                 }
+
                 requestObservabilityWrite(false);
-                warnOnce("write:" + fileName, "Failed writing export file " + outputPath, ex);
+                warnOnce(
+                    "write:" + fileName,
+                    "Failed writing export dataset " +
+                        dataset.key(),
+                    ex
+                );
+            }
+        });
+    }
+
+    private void queueDerivedViewRebuild(
+        Path outputDir)
+    {
+        if (exportStore == null ||
+            outputDir == null ||
+            !unifiedRebuildQueued.compareAndSet(false, true))
+        {
+            return;
+        }
+
+        submitWriter(() ->
+        {
+            try
+            {
+                // Ignore a queued rebuild for an account that is no longer
+                // active. Its fragments are already safely persisted.
+                if (!outputDir.equals(accountOutputDir))
+                {
+                    return;
+                }
+
+                exportStore.rebuildDerivedViews(outputDir);
+                warnedFailureKeys.remove(
+                    "write:derived_views"
+                );
+            }
+            catch (IOException | RuntimeException ex)
+            {
+                warnOnce(
+                    "write:derived_views",
+                    "Failed rebuilding derived Character Export views for " +
+                        outputDir,
+                    ex
+                );
+            }
+            finally
+            {
+                unifiedRebuildQueued.set(false);
             }
         });
     }
@@ -2090,8 +2955,9 @@ public class CharacterStateExporterPlugin extends Plugin
     private void manualExportAll()
     {
         panel.beginManualSync();
-        // Collection log can only be updated by physically clicking entries in-game;
-        // skip it from the sync so the row display is left untouched.
+        // A full Collection Log reconciliation requires the Collection Log
+        // interface to be open. Character Export triggers Search automatically
+        // when that interface opens; Refresh Now does not open interfaces.
         panel.skipDatasetInSync("collection_log");
         clientThread.invokeLater(() ->
         {
@@ -2102,7 +2968,11 @@ public class CharacterStateExporterPlugin extends Plugin
             }
             exportQuestSnapshot("manual_panel");
             exportDiarySnapshot("manual_panel");
+            exportProgressFlags("manual_panel");
+            exportTravelGates("manual_panel");
+            exportUniversalState("manual_panel");
             exportCombatAchievementSnapshot("manual_panel");
+            requestDwmsStorageSnapshot("manual_panel", 0L);
         });
     }
 
@@ -2182,53 +3052,73 @@ public class CharacterStateExporterPlugin extends Plugin
 
     private void resetExporterLogSync()
     {
-        Path outputPath = BASE_OUTPUT_DIR.resolve(EXPORTER_LOG_FILE);
+        Path outputPath = diagnosticPath(EXPORTER_LOG_FILE);
+        if (outputPath == null)
+        {
+            return;
+        }
+
         try
         {
-            writeTextFileSync(outputPath, "");
-            warnedFailureKeys.remove("log:" + EXPORTER_LOG_FILE);
+            AtomicFileWriter.writeUtf8(outputPath, "");
+            warnedFailureKeys.remove(
+                "log:" + EXPORTER_LOG_FILE
+            );
         }
         catch (IOException ex)
         {
-            warnOnce("log:" + EXPORTER_LOG_FILE, "Failed resetting exporter log " + outputPath, ex);
+            warnOnce(
+                "log:" + EXPORTER_LOG_FILE,
+                "Failed resetting exporter log " + outputPath,
+                ex
+            );
         }
     }
 
     private void appendExporterLogSync(String serializedLine)
     {
-        Path outputPath = BASE_OUTPUT_DIR.resolve(EXPORTER_LOG_FILE);
+        Path outputPath = diagnosticPath(EXPORTER_LOG_FILE);
+        if (outputPath == null)
+        {
+            return;
+        }
+
         try
         {
             Files.createDirectories(outputPath.getParent());
-            if (Files.exists(outputPath) && Files.size(outputPath) >= EXPORTER_LOG_MAX_BYTES)
+            if (Files.exists(outputPath) &&
+                Files.size(outputPath) >= EXPORTER_LOG_MAX_BYTES)
             {
-                Files.write(
-                    outputPath,
-                    new byte[0],
-                    StandardOpenOption.CREATE,
-                    StandardOpenOption.TRUNCATE_EXISTING,
-                    StandardOpenOption.WRITE
-                );
+                AtomicFileWriter.writeUtf8(outputPath, "");
             }
 
             Files.write(
                 outputPath,
-                (serializedLine + System.lineSeparator()).getBytes(StandardCharsets.UTF_8),
+                (serializedLine + System.lineSeparator())
+                    .getBytes(StandardCharsets.UTF_8),
                 StandardOpenOption.CREATE,
                 StandardOpenOption.APPEND,
                 StandardOpenOption.WRITE
             );
-            warnedFailureKeys.remove("log:" + EXPORTER_LOG_FILE);
+            warnedFailureKeys.remove(
+                "log:" + EXPORTER_LOG_FILE
+            );
         }
         catch (IOException ex)
         {
-            warnOnce("log:" + EXPORTER_LOG_FILE, "Failed writing exporter log " + outputPath, ex);
+            warnOnce(
+                "log:" + EXPORTER_LOG_FILE,
+                "Failed writing exporter log " + outputPath,
+                ex
+            );
         }
     }
 
     private void requestObservabilityWrite(boolean force)
     {
-        if (!writesEnabled || !config.debugLogging())
+        if (!writesEnabled ||
+            !config.debugLogging() ||
+            accountOutputDir == null)
         {
             return;
         }
@@ -2288,30 +3178,40 @@ public class CharacterStateExporterPlugin extends Plugin
         return lastObservabilityWriteAt.compareAndSet(previous, now);
     }
 
-    private void writeAuxJsonSync(String fileName, String json)
+    private void writeAuxJsonSync(
+        String fileName,
+        String json)
     {
-        Path outputPath = BASE_OUTPUT_DIR.resolve(fileName);
+        Path outputPath = diagnosticPath(fileName);
+        if (outputPath == null)
+        {
+            return;
+        }
+
         try
         {
-            writeTextFileSync(outputPath, json + System.lineSeparator());
+            AtomicFileWriter.writeUtf8(
+                outputPath,
+                json + System.lineSeparator()
+            );
             warnedFailureKeys.remove("aux:" + fileName);
         }
         catch (IOException ex)
         {
-            warnOnce("aux:" + fileName, "Failed writing observability file " + outputPath, ex);
+            warnOnce(
+                "aux:" + fileName,
+                "Failed writing observability file " + outputPath,
+                ex
+            );
         }
     }
 
-    private void writeTextFileSync(Path outputPath, String content) throws IOException
+    private Path diagnosticPath(String fileName)
     {
-        Files.createDirectories(outputPath.getParent());
-        Files.write(
-            outputPath,
-            content.getBytes(StandardCharsets.UTF_8),
-            StandardOpenOption.CREATE,
-            StandardOpenOption.TRUNCATE_EXISTING,
-            StandardOpenOption.WRITE
-        );
+        Path dir = accountOutputDir;
+        return dir == null
+            ? null
+            : ExportLayout.diagnosticsDir(dir).resolve(fileName);
     }
 
     private void submitWriter(Runnable task)
@@ -2347,6 +3247,14 @@ public class CharacterStateExporterPlugin extends Plugin
         readinessSnapshot.put("inventory_container_present", client.getItemContainer(InventoryID.INV) != null);
         readinessSnapshot.put("equipment_container_present", client.getItemContainer(InventoryID.WORN) != null);
         readinessSnapshot.put("world", client.getWorld());
+        if (currentAccountHash != null)
+        {
+            readinessSnapshot.put("account_hash", currentAccountHash);
+        }
+        else
+        {
+            readinessSnapshot.remove("account_hash");
+        }
         readinessSnapshot.put("game_state", client.getGameState().name());
     }
 
@@ -2357,6 +3265,9 @@ public class CharacterStateExporterPlugin extends Plugin
         payload.put("plugin_version", PLUGIN_VERSION);
         payload.put("session_id", sessionId);
         payload.put("reason", reason);
+        Player player = client.getLocalPlayer();
+        payload.put("account_name", player != null ? player.getName() : currentAccountName);
+        payload.put("account_hash", currentAccountHash);
         return payload;
     }
 
@@ -2371,21 +3282,6 @@ public class CharacterStateExporterPlugin extends Plugin
             warnOnce("serialize:" + context, "Failed serializing payload for " + context, ex);
             return null;
         }
-    }
-
-    private String stableJson(Map<String, Object> payload)
-    {
-        Map<String, Object> copy = new LinkedHashMap<>();
-        for (Map.Entry<String, Object> entry : payload.entrySet())
-        {
-            String key = entry.getKey();
-            if ("exported_at".equals(key) || "reason".equals(key))
-            {
-                continue;
-            }
-            copy.put(key, entry.getValue());
-        }
-        return serializePayload("stable_payload", copy);
     }
 
     private boolean initializeBaseOutputDirectory()
@@ -2502,48 +3398,51 @@ public class CharacterStateExporterPlugin extends Plugin
         }
     }
 
-    private static final class CombatTask
-    {
-        final int id;
-        final String name;
-        final int tier; // 1 = Easy, 2 = Medium, 3 = Hard, 4 = Elite, 5 = Master, 6 = Grandmaster
-
-        CombatTask(int id, String name, int tier)
-        {
-            this.id = id;
-            this.name = name;
-            this.tier = tier;
-        }
-    }
-
     private enum ContainerKind
     {
-        BANK("bank", "bank.json", InventoryID.BANK, CONTAINER_EXPORT_INTERVAL_MS),
-        SEED_VAULT("seed_vault", "seed_vault.json", InventoryID.SEED_VAULT, CONTAINER_EXPORT_INTERVAL_MS),
-        INVENTORY("inventory", "inventory.json", InventoryID.INV, INVENTORY_EXPORT_INTERVAL_MS),
-        EQUIPMENT("equipment", "equipment.json", InventoryID.WORN, CONTAINER_EXPORT_INTERVAL_MS);
+        BANK(
+            ExportDataset.BANK,
+            InventoryID.BANK,
+            CONTAINER_EXPORT_INTERVAL_MS
+        ),
+        SEED_VAULT(
+            ExportDataset.SEED_VAULT,
+            InventoryID.SEED_VAULT,
+            CONTAINER_EXPORT_INTERVAL_MS
+        ),
+        INVENTORY(
+            ExportDataset.INVENTORY,
+            InventoryID.INV,
+            INVENTORY_EXPORT_INTERVAL_MS
+        ),
+        EQUIPMENT(
+            ExportDataset.EQUIPMENT,
+            InventoryID.WORN,
+            CONTAINER_EXPORT_INTERVAL_MS
+        );
 
-        private final String datasetKey;
-        private final String fileName;
+        private final ExportDataset dataset;
         private final int inventoryId;
         private final long minimumIntervalMs;
 
-        ContainerKind(String datasetKey, String fileName, int inventoryId, long minimumIntervalMs)
+        ContainerKind(
+            ExportDataset dataset,
+            int inventoryId,
+            long minimumIntervalMs)
         {
-            this.datasetKey = datasetKey;
-            this.fileName = fileName;
+            this.dataset = dataset;
             this.inventoryId = inventoryId;
             this.minimumIntervalMs = minimumIntervalMs;
         }
 
         String getDatasetKey()
         {
-            return datasetKey;
+            return dataset.key();
         }
 
         String getFileName()
         {
-            return fileName;
+            return dataset.fragmentFileName();
         }
 
         int getInventoryId()

@@ -23,72 +23,60 @@
  * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
  * POSSIBILITY OF SUCH DAMAGE.
  */
+
 package com.dzwnk.exporter;
 
+import com.google.gson.Gson;
 import java.awt.BorderLayout;
 import java.awt.Color;
-import java.awt.Component;
 import java.awt.Desktop;
 import java.awt.Dimension;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
+import java.util.EnumMap;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicLong;
 import javax.swing.BorderFactory;
 import javax.swing.Box;
 import javax.swing.BoxLayout;
-import javax.swing.DefaultListCellRenderer;
 import javax.swing.JButton;
-import javax.swing.JComboBox;
 import javax.swing.JLabel;
-import javax.swing.JList;
 import javax.swing.JPanel;
 import javax.swing.SwingUtilities;
-import javax.swing.UIManager;
+import javax.swing.Timer;
 import javax.swing.border.EmptyBorder;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.client.ui.ColorScheme;
+import net.runelite.client.ui.FontManager;
 import net.runelite.client.ui.PluginPanel;
 
+/**
+ * Compact RuneLite-native status panel for Character Export.
+ *
+ * All dataset metadata and freshness rules come from ExportDataset and
+ * DatasetFreshness; the panel does not maintain its own parallel policy table.
+ */
 @Slf4j
 class CharacterStateExporterPanel extends PluginPanel
 {
-    private static final DateTimeFormatter TIME_FMT = DateTimeFormatter.ofPattern("h:mm:ss a");
-    private static final DateTimeFormatter DATE_TIME_FMT = DateTimeFormatter.ofPattern("MMM d, h:mm:ss a");
-    private static final int BUTTON_WIDTH = 170;
-    private static final String[] DATASET_FILES = {
-        "bank.json", "character.json", "diaries.json", "quests.json",
-        "inventory.json", "equipment.json", "seed_vault.json", "combat_achievements.json", "collection_log.json"
-    };
+    private static final DateTimeFormatter TIME_FMT =
+        DateTimeFormatter.ofPattern("h:mm:ss a");
+    private static final DateTimeFormatter DATE_TIME_FMT =
+        DateTimeFormatter.ofPattern("MMM d, h:mm:ss a");
 
-    static final String[] DATASET_KEYS = {
-        "bank", "character", "diaries", "quests",
-        "inventory", "equipment", "seed_vault", "combat_achievements", "collection_log"
-    };
-    private static final String[] DATASET_LABELS = {
-        "Bank", "Stats", "Diaries", "Quests",
-        "Inventory", "Equipment", "Seed Vault", "Combat Tasks", "Collection Log"
-    };
-    private static final String[] DATASET_HINTS = {
-        "Log in", "Log in", "Log in", "Log in",
-        "Log in", "Log in", "Log in", "Log in", "Log in"
-    };
-    private static final String[] DATASET_READY_HINTS = {
-        "Open bank",
-        "Sync or train",
-        "Sync or open diary",
-        "Sync or quest",
-        "Sync or move item",
-        "Sync or change gear",
-        "Open vault",
-        "Sync or complete task",
-        "Open log"
-    };
+    private static final int BUTTON_HEIGHT = 30;
+    private static final int STATUS_ROW_HEIGHT = 31;
+    private static final Color STALE_COLOR =
+        new Color(255, 193, 7);
+    private static final Color ERROR_COLOR =
+        new Color(196, 64, 64);
 
     enum SyncOutcome
     {
@@ -100,253 +88,420 @@ class CharacterStateExporterPanel extends PluginPanel
 
     private static final class StatusRow
     {
-        private final JLabel timeLabel;
-        private final JLabel detailLabel;
+        private final JLabel primary;
+        private final JLabel detail;
 
-        private StatusRow(JLabel timeLabel, JLabel detailLabel)
+        private StatusRow(
+            JLabel primary,
+            JLabel detail)
         {
-            this.timeLabel = timeLabel;
-            this.detailLabel = detailLabel;
+            this.primary = primary;
+            this.detail = detail;
         }
     }
 
-    private final Map<String, StatusRow> statusRows = new LinkedHashMap<>();
-    private final Map<String, String> datasetFiles = new LinkedHashMap<>();
-    private final JLabel directoryLabel;
-    private final JLabel accountLabel;
-    private final JComboBox<String> openFileDropdown;
-    private volatile Path currentOutputDir;
-    private final Object manualSyncLock = new Object();
-    private boolean manualSyncInProgress;
-    private final Map<String, SyncOutcome> manualSyncOutcomes = new LinkedHashMap<>();
-    private boolean dropdownRebuilding;
+    private final Gson gson;
+    private final String sessionId;
+    private final Map<ExportDataset, StatusRow> statusRows =
+        new EnumMap<>(ExportDataset.class);
+    private final Map<String, SyncOutcome> manualSyncOutcomes =
+        new LinkedHashMap<>();
+    private final AtomicLong accountViewGeneration =
+        new AtomicLong();
 
-    CharacterStateExporterPanel(Runnable exportAllAction)
+    private final JLabel accountLabel;
+    private final JLabel interactionNoteLabel;
+    private final CharacterStateViewerPanel viewerPanel;
+    private final JButton refreshButton;
+    private final Timer freshnessTimer;
+
+    private final Object manualSyncLock = new Object();
+    private volatile Path currentOutputDir;
+    private volatile String renderedAccountName;
+    private volatile Path renderedOutputDir;
+    private boolean manualSyncInProgress;
+
+    CharacterStateExporterPanel(
+        Runnable exportAllAction,
+        String buildLabel,
+        Gson gson,
+        String sessionId)
     {
         super(false);
-        setLayout(new BoxLayout(this, BoxLayout.Y_AXIS));
-        setBorder(new EmptyBorder(10, 10, 10, 10));
+        this.gson = gson;
+        this.sessionId = sessionId;
 
-        // Account name
-        accountLabel = new JLabel("Not logged in");
-        accountLabel.setHorizontalAlignment(JLabel.CENTER);
+        setLayout(new BoxLayout(this, BoxLayout.Y_AXIS));
+        setBackground(ColorScheme.DARK_GRAY_COLOR);
+        setBorder(new EmptyBorder(8, 8, 8, 8));
+
+        JLabel title = centeredLabel("Character Export");
+        title.setFont(FontManager.getRunescapeBoldFont());
+        title.setForeground(Color.WHITE);
+        add(title);
+
+        JLabel version = centeredLabel(buildLabel);
+        version.setFont(FontManager.getRunescapeSmallFont());
+        version.setForeground(ColorScheme.LIGHT_GRAY_COLOR);
+        version.setBorder(new EmptyBorder(0, 0, 5, 0));
+        add(version);
+
+        accountLabel = centeredLabel("Not logged in");
+        accountLabel.setFont(FontManager.getRunescapeBoldFont());
         accountLabel.setForeground(ColorScheme.LIGHT_GRAY_COLOR);
-        accountLabel.setBorder(new EmptyBorder(0, 0, 6, 0));
-        accountLabel.setAlignmentX(CENTER_ALIGNMENT);
-        accountLabel.setMaximumSize(new Dimension(Integer.MAX_VALUE, accountLabel.getPreferredSize().height + 4));
+        accountLabel.setBorder(new EmptyBorder(0, 0, 2, 0));
         add(accountLabel);
 
-        // Status header
-        JLabel statusHeader = new JLabel("Export Status");
-        statusHeader.setHorizontalAlignment(JLabel.CENTER);
-        statusHeader.setForeground(Color.WHITE);
-        statusHeader.setBorder(new EmptyBorder(0, 0, 6, 0));
-        statusHeader.setAlignmentX(CENTER_ALIGNMENT);
-        statusHeader.setMaximumSize(new Dimension(Integer.MAX_VALUE, statusHeader.getPreferredSize().height + 4));
-        add(statusHeader);
+        JLabel publicSurface = centeredLabel("13 public JSON snapshots");
+        publicSurface.setFont(FontManager.getRunescapeSmallFont());
+        publicSurface.setForeground(ColorScheme.LIGHT_GRAY_COLOR);
+        publicSurface.setToolTipText(
+            "Character Export publishes 13 account-root JSON files."
+        );
+        publicSurface.setBorder(new EmptyBorder(0, 0, 5, 0));
+        add(publicSurface);
 
-        // Dataset status rows
         JPanel statusGrid = new JPanel();
-        statusGrid.setLayout(new BoxLayout(statusGrid, BoxLayout.Y_AXIS));
-        statusGrid.setBackground(ColorScheme.DARKER_GRAY_COLOR);
-        statusGrid.setBorder(new EmptyBorder(8, 8, 8, 8));
+        statusGrid.setLayout(
+            new BoxLayout(statusGrid, BoxLayout.Y_AXIS)
+        );
+        statusGrid.setOpaque(false);
+        statusGrid.setBorder(new EmptyBorder(0, 0, 0, 0));
 
-        for (int i = 0; i < DATASET_KEYS.length; i++)
+        java.util.List<ExportDataset> datasets =
+            ExportDataset.panelDatasets();
+        for (int i = 0; i < datasets.size(); i++)
         {
-            final String datasetKey = DATASET_KEYS[i];
-            final String datasetFile = DATASET_FILES[i];
-            datasetFiles.put(datasetKey, datasetFile);
-
-            JPanel row = new JPanel(new BorderLayout(8, 0));
-            row.setOpaque(false);
-
-            JLabel nameLabel = new JLabel(DATASET_LABELS[i]);
-            nameLabel.setHorizontalAlignment(JLabel.LEFT);
-            nameLabel.setForeground(ColorScheme.LIGHT_GRAY_COLOR);
-            nameLabel.setPreferredSize(new Dimension(80, 28));
-            row.add(nameLabel, BorderLayout.WEST);
-
-            JPanel statusPanel = new JPanel();
-            statusPanel.setOpaque(false);
-            statusPanel.setLayout(new BoxLayout(statusPanel, BoxLayout.Y_AXIS));
-
-            JLabel timeLabel = new JLabel(DATASET_HINTS[i]);
-            timeLabel.setAlignmentX(CENTER_ALIGNMENT);
-            timeLabel.setHorizontalAlignment(JLabel.CENTER);
-            timeLabel.setForeground(ColorScheme.LIGHT_GRAY_COLOR);
-            statusPanel.add(timeLabel);
-
-            JLabel detailLabel = new JLabel(" ");
-            detailLabel.setAlignmentX(CENTER_ALIGNMENT);
-            detailLabel.setHorizontalAlignment(JLabel.CENTER);
-            detailLabel.setForeground(ColorScheme.LIGHT_GRAY_COLOR);
-            statusPanel.add(detailLabel);
-            row.add(statusPanel, BorderLayout.CENTER);
-
-            statusRows.put(datasetKey, new StatusRow(timeLabel, detailLabel));
-            statusGrid.add(row);
-            if (i < DATASET_KEYS.length - 1)
+            ExportDataset dataset = datasets.get(i);
+            statusGrid.add(createStatusRow(dataset));
+            if (i < datasets.size() - 1)
             {
-                statusGrid.add(Box.createRigidArea(new Dimension(0, 6)));
+                statusGrid.add(
+                    Box.createRigidArea(new Dimension(0, 1))
+                );
             }
         }
 
-        statusGrid.setMaximumSize(new Dimension(Integer.MAX_VALUE, statusGrid.getPreferredSize().height + 10));
-        add(statusGrid);
-        add(Box.createRigidArea(new Dimension(0, 10)));
-
-        // Buttons
-        JButton exportAllButton = createCenteredButton("Sync Available");
-        exportAllButton.addActionListener(e -> exportAllAction.run());
-        add(exportAllButton);
-
-        add(Box.createRigidArea(new Dimension(0, 6)));
-
-        JButton openFolderButton = createCenteredButton("Open Folder");
-        openFolderButton.addActionListener(e -> openOutputFolder());
-        add(openFolderButton);
-
-        add(Box.createRigidArea(new Dimension(0, 6)));
-
-        JLabel openFileLabel = new JLabel("Open File");
-        openFileLabel.setHorizontalAlignment(JLabel.CENTER);
-        openFileLabel.setForeground(ColorScheme.LIGHT_GRAY_COLOR);
-        openFileLabel.setAlignmentX(CENTER_ALIGNMENT);
-        openFileLabel.setMaximumSize(new Dimension(Integer.MAX_VALUE, openFileLabel.getPreferredSize().height + 2));
-        add(openFileLabel);
-        add(Box.createRigidArea(new Dimension(0, 4)));
-
-        openFileDropdown = new JComboBox<>();
-        openFileDropdown.setAlignmentX(CENTER_ALIGNMENT);
-        openFileDropdown.setFont(UIManager.getFont("Button.font"));
-        openFileDropdown.setRenderer(new DefaultListCellRenderer()
-        {
-            @Override
-            public Component getListCellRendererComponent(JList<?> list, Object value, int index, boolean isSelected, boolean cellHasFocus)
-            {
-                JLabel label = (JLabel) super.getListCellRendererComponent(list, value, index, isSelected, cellHasFocus);
-                label.setHorizontalAlignment(JLabel.CENTER);
-                return label;
-            }
-        });
-        Dimension dropdownSize = new Dimension(BUTTON_WIDTH, 30);
-        openFileDropdown.setPreferredSize(dropdownSize);
-        openFileDropdown.setMinimumSize(dropdownSize);
-        openFileDropdown.setMaximumSize(dropdownSize);
-        openFileDropdown.addActionListener(e -> handleOpenFileSelection());
-        add(openFileDropdown);
-        rebuildOpenFileDropdown();
-
-        add(Box.createRigidArea(new Dimension(0, 12)));
-
-        // Output directory
-        JPanel dirPanel = new JPanel(new BorderLayout());
-        dirPanel.setBackground(ColorScheme.DARKER_GRAY_COLOR);
-        dirPanel.setBorder(BorderFactory.createCompoundBorder(
-            BorderFactory.createMatteBorder(0, 0, 1, 0, ColorScheme.MEDIUM_GRAY_COLOR),
-            new EmptyBorder(8, 8, 8, 8)
-        ));
-
-        JLabel dirTitle = new JLabel("Output folder:");
-        dirTitle.setHorizontalAlignment(JLabel.CENTER);
-        dirTitle.setForeground(ColorScheme.LIGHT_GRAY_COLOR);
-        dirPanel.add(dirTitle, BorderLayout.NORTH);
-
-        directoryLabel = new JLabel("character-exporter/");
-        directoryLabel.setHorizontalAlignment(JLabel.CENTER);
-        directoryLabel.setForeground(Color.WHITE);
-        directoryLabel.setBorder(new EmptyBorder(4, 0, 0, 0));
-        dirPanel.add(directoryLabel, BorderLayout.CENTER);
-
-        dirPanel.setAlignmentX(CENTER_ALIGNMENT);
-        dirPanel.setMaximumSize(new Dimension(Integer.MAX_VALUE, dirPanel.getPreferredSize().height + 20));
-        add(dirPanel);
-        add(Box.createRigidArea(new Dimension(0, 10)));
-
-        // Notes — export trigger guide and collection log caveat.
-        // getMaximumSize() is overridden so BoxLayout never expands the panel
-        // beyond its actual content height.
-        JPanel notesPanel = new JPanel(new BorderLayout())
-        {
-            @Override
-            public Dimension getMaximumSize()
-            {
-                return new Dimension(Integer.MAX_VALUE, getPreferredSize().height);
-            }
-        };
-        notesPanel.setBackground(ColorScheme.DARKER_GRAY_COLOR);
-        notesPanel.setBorder(BorderFactory.createCompoundBorder(
-            BorderFactory.createMatteBorder(0, 0, 1, 0, ColorScheme.MEDIUM_GRAY_COLOR),
-            new EmptyBorder(8, 8, 8, 8)
-        ));
-
-        JLabel notesLabel = new JLabel(
-            "<html>"
-                + "'Sync Available' exports Stats, Quests, Diaries, Tasks, "
-                + "Inventory &amp; Equipment.<br><br>"
-                + "Bank &amp; Seed Vault need to be opened in-game.<br><br>"
-                + "Collection Log needs to have each entry clicked in-game."
-                + "</html>"
+        statusGrid.setAlignmentX(CENTER_ALIGNMENT);
+        statusGrid.setMaximumSize(
+            new Dimension(
+                Integer.MAX_VALUE,
+                datasets.size() * (STATUS_ROW_HEIGHT + 1) - 1
+            )
         );
-        notesLabel.setHorizontalAlignment(JLabel.LEFT);
-        notesLabel.setForeground(ColorScheme.LIGHT_GRAY_COLOR);
-        notesPanel.add(notesLabel, BorderLayout.NORTH);
-        notesPanel.setAlignmentX(CENTER_ALIGNMENT);
-        add(notesPanel);
+        add(statusGrid);
+        add(Box.createRigidArea(new Dimension(0, 8)));
+
+        interactionNoteLabel = new JLabel();
+        interactionNoteLabel.setFont(
+            FontManager.getRunescapeSmallFont()
+        );
+        interactionNoteLabel.setHorizontalAlignment(
+            JLabel.CENTER
+        );
+        interactionNoteLabel.setAlignmentX(CENTER_ALIGNMENT);
+        interactionNoteLabel.setOpaque(true);
+        interactionNoteLabel.setBackground(
+            ColorScheme.DARKER_GRAY_COLOR
+        );
+        interactionNoteLabel.setForeground(
+            ColorScheme.LIGHT_GRAY_COLOR
+        );
+        interactionNoteLabel.setBorder(
+            BorderFactory.createCompoundBorder(
+                BorderFactory.createMatteBorder(
+                    1,
+                    0,
+                    1,
+                    0,
+                    ColorScheme.MEDIUM_GRAY_COLOR
+                ),
+                new EmptyBorder(7, 8, 7, 8)
+            )
+        );
+        interactionNoteLabel.setMaximumSize(
+            new Dimension(Integer.MAX_VALUE, 52)
+        );
+        add(interactionNoteLabel);
+        add(Box.createRigidArea(new Dimension(0, 8)));
+
+        refreshButton = createButton("Refresh Now");
+        refreshButton.setToolTipText(
+            "Force an immediate snapshot of everything RuneLite can currently observe."
+        );
+        refreshButton.addActionListener(
+            event -> exportAllAction.run()
+        );
+        add(refreshButton);
+        add(Box.createRigidArea(new Dimension(0, 6)));
+
+        JButton openFolderButton = createButton("Open Folder");
+        openFolderButton.setToolTipText(
+            "Open this character's export folder."
+        );
+        openFolderButton.addActionListener(
+            event -> openOutputFolder()
+        );
+        add(openFolderButton);
+        add(Box.createRigidArea(new Dimension(0, 6)));
+
+        viewerPanel = new CharacterStateViewerPanel();
+        viewerPanel.setVisible(false);
+        viewerPanel.setAlignmentX(CENTER_ALIGNMENT);
+        viewerPanel.setMaximumSize(
+            new Dimension(Integer.MAX_VALUE, 430)
+        );
+
+        JButton viewerButton = createButton("Browse JSON");
+        viewerButton.setToolTipText(
+            "Search all 13 public account-root JSON files."
+        );
+        viewerButton.addActionListener(event ->
+        {
+            boolean show = !viewerPanel.isVisible();
+            viewerPanel.setVisible(show);
+            viewerButton.setText(
+                show ? "Hide JSON" : "Browse JSON"
+            );
+
+            if (show)
+            {
+                viewerPanel.refreshAsync();
+            }
+
+            revalidate();
+            repaint();
+        });
+        add(viewerButton);
+        add(viewerPanel);
+
+        freshnessTimer = new Timer(
+            60_000,
+            event -> refreshInteractiveFreshnessFromDisk()
+        );
+        freshnessTimer.setInitialDelay(60_000);
+        freshnessTimer.setRepeats(true);
+        freshnessTimer.start();
+
+        refreshInteractionNote();
+    }
+
+    private JPanel createStatusRow(ExportDataset dataset)
+    {
+        JPanel row = new JPanel(new BorderLayout(8, 0));
+        row.setOpaque(true);
+        row.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+        row.setBorder(
+            BorderFactory.createCompoundBorder(
+                BorderFactory.createMatteBorder(
+                    0,
+                    0,
+                    1,
+                    0,
+                    ColorScheme.DARK_GRAY_COLOR
+                ),
+                new EmptyBorder(3, 7, 3, 7)
+            )
+        );
+        row.setPreferredSize(new Dimension(0, STATUS_ROW_HEIGHT));
+        row.setMaximumSize(
+            new Dimension(Integer.MAX_VALUE, STATUS_ROW_HEIGHT)
+        );
+
+        JLabel name = new JLabel(dataset.label());
+        name.setFont(FontManager.getRunescapeSmallFont());
+        name.setForeground(ColorScheme.LIGHT_GRAY_COLOR);
+        name.setPreferredSize(new Dimension(102, STATUS_ROW_HEIGHT - 2));
+        if (dataset.publicFileName() != null)
+        {
+            name.setToolTipText(dataset.publicFileName());
+            row.setToolTipText(dataset.publicFileName());
+        }
+        row.add(name, BorderLayout.WEST);
+
+        JPanel status = new JPanel();
+        status.setOpaque(false);
+        status.setLayout(
+            new BoxLayout(status, BoxLayout.Y_AXIS)
+        );
+
+        JLabel primary = centeredLabel("Log in");
+        primary.setFont(
+            FontManager.getRunescapeSmallFont().deriveFont(
+                java.awt.Font.BOLD
+            )
+        );
+        primary.setForeground(ColorScheme.LIGHT_GRAY_COLOR);
+        status.add(primary);
+
+        JLabel detail = centeredLabel(" ");
+        detail.setFont(FontManager.getRunescapeSmallFont());
+        detail.setForeground(ColorScheme.LIGHT_GRAY_COLOR);
+        status.add(detail);
+
+        row.add(status, BorderLayout.CENTER);
+        statusRows.put(
+            dataset,
+            new StatusRow(primary, detail)
+        );
+        return row;
+    }
+
+    private static JLabel centeredLabel(String text)
+    {
+        JLabel label = new JLabel(text);
+        label.setHorizontalAlignment(JLabel.CENTER);
+        label.setAlignmentX(CENTER_ALIGNMENT);
+        label.setMaximumSize(
+            new Dimension(Integer.MAX_VALUE, 24)
+        );
+        return label;
+    }
+
+    private static JButton createButton(String text)
+    {
+        JButton button = new JButton(text);
+        button.setAlignmentX(CENTER_ALIGNMENT);
+        button.setFocusPainted(false);
+        button.setFont(FontManager.getRunescapeSmallFont());
+        button.setForeground(Color.WHITE);
+        button.setBackground(ColorScheme.MEDIUM_GRAY_COLOR);
+        button.setBorder(
+            BorderFactory.createCompoundBorder(
+                BorderFactory.createLineBorder(
+                    ColorScheme.DARKER_GRAY_COLOR
+                ),
+                new EmptyBorder(5, 8, 5, 8)
+            )
+        );
+        button.setMaximumSize(
+            new Dimension(Integer.MAX_VALUE, BUTTON_HEIGHT)
+        );
+        button.setPreferredSize(
+            new Dimension(170, BUTTON_HEIGHT)
+        );
+        return button;
     }
 
     void setAccount(String playerName, Path outputDir)
     {
-        currentOutputDir = outputDir;
-        SwingUtilities.invokeLater(() ->
+        if (playerName == null ||
+            playerName.trim().isEmpty() ||
+            outputDir == null)
         {
+            return;
+        }
+
+        currentOutputDir = outputDir;
+        final long generation =
+            accountViewGeneration.incrementAndGet();
+
+        runOnEdt(() ->
+        {
+            if (generation != accountViewGeneration.get())
+            {
+                return;
+            }
+
+            renderedAccountName = playerName;
+            renderedOutputDir = outputDir;
             accountLabel.setText(playerName);
             accountLabel.setForeground(Color.WHITE);
-            directoryLabel.setText("character-exporter/" + playerName + "/");
-            for (int i = 0; i < DATASET_KEYS.length; i++)
-            {
-                StatusRow row = statusRows.get(DATASET_KEYS[i]);
-                if (row != null && !hasExistingDatasetFile(DATASET_KEYS[i]))
-                {
-                    row.timeLabel.setText(DATASET_READY_HINTS[i]);
-                    row.timeLabel.setForeground(ColorScheme.LIGHT_GRAY_COLOR);
-                    row.timeLabel.setToolTipText(null);
-                    row.detailLabel.setText(" ");
-                    row.detailLabel.setForeground(ColorScheme.LIGHT_GRAY_COLOR);
-                    row.detailLabel.setToolTipText(null);
-                }
-            }
-            rebuildOpenFileDropdown();
+            viewerPanel.setDirectory(outputDir);
+            resetDatasetRowsForAccount();
+            refreshFromDisk();
         });
+    }
+
+    void refreshAccountIdentity(
+        String playerName,
+        Path outputDir)
+    {
+        if (playerName == null ||
+            playerName.trim().isEmpty() ||
+            outputDir == null)
+        {
+            return;
+        }
+
+        currentOutputDir = outputDir;
+        if (playerName.equals(renderedAccountName) &&
+            outputDir.equals(renderedOutputDir))
+        {
+            return;
+        }
+
+        setAccount(playerName, outputDir);
+    }
+
+    void shutdown()
+    {
+        freshnessTimer.stop();
+        viewerPanel.setDirectory(null);
     }
 
     void clearAccount()
     {
         currentOutputDir = null;
-        SwingUtilities.invokeLater(() ->
+        final long generation =
+            accountViewGeneration.incrementAndGet();
+
+        runOnEdt(() ->
         {
+            if (generation != accountViewGeneration.get())
+            {
+                return;
+            }
+
+            renderedAccountName = null;
+            renderedOutputDir = null;
             accountLabel.setText("Not logged in");
-            accountLabel.setForeground(ColorScheme.LIGHT_GRAY_COLOR);
-            directoryLabel.setText("character-exporter/");
+            accountLabel.setForeground(
+                ColorScheme.LIGHT_GRAY_COLOR
+            );
+            viewerPanel.setDirectory(null);
+
             synchronized (manualSyncLock)
             {
                 manualSyncInProgress = false;
                 manualSyncOutcomes.clear();
             }
-            for (int i = 0; i < DATASET_KEYS.length; i++)
+
+            refreshButton.setEnabled(true);
+            refreshButton.setText("Refresh Now");
+
+            for (ExportDataset dataset :
+                ExportDataset.values())
             {
-                StatusRow row = statusRows.get(DATASET_KEYS[i]);
-                if (row != null)
-                {
-                    row.timeLabel.setText(DATASET_HINTS[i]);
-                    row.timeLabel.setForeground(ColorScheme.LIGHT_GRAY_COLOR);
-                    row.timeLabel.setToolTipText(null);
-                    row.detailLabel.setText(" ");
-                    row.detailLabel.setForeground(ColorScheme.LIGHT_GRAY_COLOR);
-                }
+                setRowState(
+                    dataset,
+                    "Log in",
+                    " ",
+                    ColorScheme.LIGHT_GRAY_COLOR,
+                    null
+                );
             }
-            rebuildOpenFileDropdown();
+
+            refreshInteractionNote();
         });
+    }
+
+    private void resetDatasetRowsForAccount()
+    {
+        for (ExportDataset dataset : ExportDataset.values())
+        {
+            setRowState(
+                dataset,
+                dataset.interactionBacked()
+                    ? "No snapshot"
+                    : dataset.readyHint(),
+                " ",
+                ColorScheme.LIGHT_GRAY_COLOR,
+                dataset.interactionBacked()
+                    ? dataset.refreshAction()
+                    : null
+            );
+        }
     }
 
     void beginManualSync()
@@ -357,149 +512,469 @@ class CharacterStateExporterPanel extends PluginPanel
             manualSyncOutcomes.clear();
         }
 
+        runOnEdt(() ->
+        {
+            refreshButton.setEnabled(false);
+            refreshButton.setText("Refreshing…");
+        });
     }
 
     void markExported(String datasetKey)
     {
-        String time = formatStatusTime(Instant.now());
-        String tooltip = formatStatusTooltip(Instant.now(), "Updated");
-        SwingUtilities.invokeLater(() ->
+        ExportDataset dataset =
+            ExportDataset.fromKey(datasetKey);
+        if (dataset == null)
         {
-            setRowState(datasetKey, time, "Updated", Color.GREEN, tooltip);
-            rebuildOpenFileDropdown();
+            return;
+        }
+
+        runOnEdt(() ->
+        {
+            renderDatasetFromDisk(
+                dataset,
+                SyncOutcome.UPDATED
+            );
+            if (viewerPanel.isVisible())
+            {
+                viewerPanel.refreshAsync();
+            }
+            refreshInteractionNote();
         });
-        recordManualOutcome(datasetKey, SyncOutcome.UPDATED);
+
+        recordManualOutcome(
+            dataset,
+            SyncOutcome.UPDATED
+        );
     }
 
     void markChecked(String datasetKey)
     {
-        String time = formatStatusTime(Instant.now());
-        String tooltip = formatStatusTooltip(Instant.now(), "Checked");
-        SwingUtilities.invokeLater(() ->
+        ExportDataset dataset =
+            ExportDataset.fromKey(datasetKey);
+        if (dataset == null)
         {
-            setRowState(datasetKey, time, "Up to date", Color.GREEN, tooltip);
+            return;
+        }
+
+        runOnEdt(() ->
+        {
+            renderDatasetFromDisk(
+                dataset,
+                SyncOutcome.UP_TO_DATE
+            );
+            refreshInteractionNote();
         });
-        recordManualOutcome(datasetKey, SyncOutcome.UP_TO_DATE);
+
+        recordManualOutcome(
+            dataset,
+            SyncOutcome.UP_TO_DATE
+        );
     }
 
-    void markUnavailable(String datasetKey, String detail, String tooltip)
+    void markUnavailable(
+        String datasetKey,
+        String detail,
+        String tooltip)
     {
-        SwingUtilities.invokeLater(() ->
+        ExportDataset dataset =
+            ExportDataset.fromKey(datasetKey);
+        if (dataset == null)
         {
-            if (hasExistingDatasetFile(datasetKey))
+            return;
+        }
+
+        runOnEdt(() ->
+        {
+            if (hasDatasetFile(dataset))
             {
-                StatusRow row = statusRows.get(datasetKey);
+                StatusRow row = statusRows.get(dataset);
                 if (row != null)
                 {
-                    row.timeLabel.setToolTipText(tooltip);
-                    row.detailLabel.setToolTipText(tooltip);
+                    row.primary.setToolTipText(tooltip);
+                    row.detail.setToolTipText(tooltip);
                 }
             }
             else
             {
                 setRowState(
-                    datasetKey,
+                    dataset,
                     "Not available",
-                    detail != null ? detail : "Unavailable",
+                    detail == null ? "Unavailable" : detail,
                     ColorScheme.LIGHT_GRAY_COLOR,
                     tooltip
                 );
             }
         });
-        recordManualOutcome(datasetKey, SyncOutcome.UNAVAILABLE);
+
+        recordManualOutcome(
+            dataset,
+            SyncOutcome.UNAVAILABLE
+        );
     }
 
-    /**
-     * Called for datasets the Sync button cannot update (e.g. collection log).
-     * Records the sync outcome so the sync-complete counter advances, but leaves
-     * the row display exactly as it was.
-     */
     void skipDatasetInSync(String datasetKey)
     {
-        recordManualOutcome(datasetKey, SyncOutcome.UNAVAILABLE);
+        ExportDataset dataset =
+            ExportDataset.fromKey(datasetKey);
+        if (dataset != null)
+        {
+            recordManualOutcome(
+                dataset,
+                SyncOutcome.UNAVAILABLE
+            );
+        }
     }
 
     void markFailed(String datasetKey, String tooltip)
     {
-        SwingUtilities.invokeLater(() -> setRowState(
-            datasetKey,
+        ExportDataset dataset =
+            ExportDataset.fromKey(datasetKey);
+        if (dataset == null)
+        {
+            return;
+        }
+
+        runOnEdt(() -> setRowState(
+            dataset,
             "Failed",
             "Try again",
-            new Color(196, 64, 64),
+            ERROR_COLOR,
             tooltip
         ));
-        recordManualOutcome(datasetKey, SyncOutcome.FAILED);
+
+        recordManualOutcome(dataset, SyncOutcome.FAILED);
     }
 
     void restoreFromDisk(Path accountDir)
     {
-        if (accountDir == null || !Files.isDirectory(accountDir))
+        if (accountDir == null ||
+            !Files.isDirectory(accountDir))
         {
             return;
         }
 
-        SwingUtilities.invokeLater(() ->
-        {
-            for (int i = 0; i < DATASET_KEYS.length; i++)
-            {
-                Path file = accountDir.resolve(DATASET_FILES[i]);
-                if (!Files.exists(file))
-                {
-                    continue;
-                }
-
-                try
-                {
-                    Instant modified = Files.getLastModifiedTime(file).toInstant();
-                    String exportedAt = formatStatusTime(modified);
-                    String tooltip = formatStatusTooltip(modified, "Saved");
-
-                    setRowState(DATASET_KEYS[i], exportedAt, "Saved", Color.GREEN, tooltip);
-                }
-                catch (IOException ignored)
-                {
-                }
-            }
-            rebuildOpenFileDropdown();
-        });
+        currentOutputDir = accountDir;
+        runOnEdt(this::refreshFromDisk);
     }
 
-    private static JButton createCenteredButton(String text)
-    {
-        JButton button = new JButton(text);
-        button.setAlignmentX(CENTER_ALIGNMENT);
-        Dimension size = new Dimension(BUTTON_WIDTH, 30);
-        button.setPreferredSize(size);
-        button.setMinimumSize(size);
-        button.setMaximumSize(size);
-        return button;
-    }
-
-    private void setRowState(String datasetKey, String primary, String detail, Color color, String tooltip)
-    {
-        StatusRow row = statusRows.get(datasetKey);
-        if (row == null)
-        {
-            return;
-        }
-
-        row.timeLabel.setText(primary);
-        row.timeLabel.setForeground(color);
-        row.timeLabel.setToolTipText(tooltip);
-        row.detailLabel.setText(detail);
-        row.detailLabel.setForeground(color);
-        row.detailLabel.setToolTipText(tooltip);
-    }
-
-    private boolean hasExistingDatasetFile(String datasetKey)
+    private void refreshFromDisk()
     {
         Path dir = currentOutputDir;
-        String fileName = datasetFiles.get(datasetKey);
-        return dir != null && fileName != null && Files.isRegularFile(dir.resolve(fileName));
+        if (dir == null || !Files.isDirectory(dir))
+        {
+            refreshInteractionNote();
+            return;
+        }
+
+        for (ExportDataset dataset :
+            ExportDataset.values())
+        {
+            if (hasDatasetFile(dataset))
+            {
+                renderDatasetFromDisk(dataset, null);
+            }
+            else if (dataset.interactionBacked())
+            {
+                setRowState(
+                    dataset,
+                    "No snapshot",
+                    dataset.readyHint(),
+                    STALE_COLOR,
+                    dataset.refreshAction()
+                );
+            }
+        }
+
+        refreshInteractionNote();
     }
 
-    private void recordManualOutcome(String datasetKey, SyncOutcome outcome)
+    private void renderDatasetFromDisk(
+        ExportDataset dataset,
+        SyncOutcome outcome)
     {
+        Path dir = currentOutputDir;
+        if (dir == null)
+        {
+            return;
+        }
+
+        Path fragmentPath =
+            ExportLayout.datasetPath(dir, dataset);
+        Map<String, Object> fragment =
+            UnifiedCharacterSnapshot.readFragment(
+                dir,
+                gson,
+                dataset
+            );
+
+        DatasetFreshness.Observation observation =
+            DatasetFreshness.evaluate(
+                dataset,
+                fragment,
+                fragmentPath,
+                sessionId
+            );
+
+        if (dataset.interactionBacked())
+        {
+            renderInteractiveDataset(dataset, observation);
+            return;
+        }
+
+        Instant observedAt = observation.observedAt();
+        if (observedAt == null)
+        {
+            Path panelPath =
+                ExportLayout.panelPath(dir, dataset);
+            try
+            {
+                if (Files.isRegularFile(panelPath))
+                {
+                    observedAt =
+                        Files.getLastModifiedTime(panelPath).toInstant();
+                }
+            }
+            catch (IOException ignored)
+            {
+            }
+        }
+
+        if (observedAt == null)
+        {
+            setRowState(
+                dataset,
+                dataset.readyHint(),
+                " ",
+                ColorScheme.LIGHT_GRAY_COLOR,
+                null
+            );
+            return;
+        }
+
+        String detail;
+        if (outcome == SyncOutcome.UPDATED)
+        {
+            detail = "Updated";
+        }
+        else if (outcome == SyncOutcome.UP_TO_DATE)
+        {
+            detail = "Up to date";
+        }
+        else if (observation.currentSession())
+        {
+            detail = "Current";
+        }
+        else
+        {
+            detail = "Saved";
+        }
+
+        setRowState(
+            dataset,
+            formatStatusTime(observedAt),
+            detail,
+            ColorScheme.PROGRESS_COMPLETE_COLOR,
+            formatStatusTooltip(observedAt, detail)
+        );
+    }
+
+    private void renderInteractiveDataset(
+        ExportDataset dataset,
+        DatasetFreshness.Observation observation)
+    {
+        Instant observedAt = observation.observedAt();
+
+        switch (observation.status())
+        {
+            case CURRENT:
+                setRowState(
+                    dataset,
+                    observedAt == null
+                        ? "Current"
+                        : formatStatusTime(observedAt),
+                    "Current",
+                    ColorScheme.PROGRESS_COMPLETE_COLOR,
+                    observedAt == null
+                        ? dataset.refreshAction()
+                        : formatInteractiveTooltip(
+                            dataset,
+                            observedAt
+                        )
+                );
+                return;
+
+            case STALE:
+                setRowState(
+                    dataset,
+                    observedAt == null
+                        ? "Stale"
+                        : formatRelativeAge(observedAt),
+                    "Stale",
+                    STALE_COLOR,
+                    observedAt == null
+                        ? dataset.refreshAction()
+                        : formatInteractiveTooltip(
+                            dataset,
+                            observedAt
+                        )
+                );
+                return;
+
+            case SAVED:
+                setRowState(
+                    dataset,
+                    observedAt == null
+                        ? "Saved"
+                        : formatStatusTime(observedAt),
+                    dataset == ExportDataset.COLLECTION_LOG
+                        ? "Saved"
+                        : dataset.readyHint(),
+                    ColorScheme.PROGRESS_COMPLETE_COLOR,
+                    observedAt == null
+                        ? dataset.refreshAction()
+                        : formatInteractiveTooltip(
+                            dataset,
+                            observedAt
+                        )
+                );
+                return;
+
+            case UNKNOWN:
+            default:
+                setRowState(
+                    dataset,
+                    "No snapshot",
+                    dataset.readyHint(),
+                    STALE_COLOR,
+                    dataset.refreshAction()
+                );
+        }
+    }
+
+    private void refreshInteractiveFreshnessFromDisk()
+    {
+        if (!SwingUtilities.isEventDispatchThread())
+        {
+            SwingUtilities.invokeLater(
+                this::refreshInteractiveFreshnessFromDisk
+            );
+            return;
+        }
+
+        for (ExportDataset dataset :
+            ExportDataset.values())
+        {
+            if (dataset.interactionBacked() &&
+                hasDatasetFile(dataset))
+            {
+                renderDatasetFromDisk(dataset, null);
+            }
+        }
+
+        refreshInteractionNote();
+    }
+
+    private void refreshInteractionNote()
+    {
+        if (!SwingUtilities.isEventDispatchThread())
+        {
+            SwingUtilities.invokeLater(this::refreshInteractionNote);
+            return;
+        }
+
+        Path dir = currentOutputDir;
+        if (dir == null)
+        {
+            interactionNoteLabel.setText(
+                "<html><b>Interactive data:</b><br>" +
+                    "Log in to check refresh needs.</html>"
+            );
+            interactionNoteLabel.setForeground(
+                ColorScheme.LIGHT_GRAY_COLOR
+            );
+            return;
+        }
+
+        java.util.List<String> pending =
+            new java.util.ArrayList<>();
+
+        for (ExportDataset dataset :
+            ExportDataset.values())
+        {
+            if (!dataset.interactionBacked())
+            {
+                continue;
+            }
+
+            Map<String, Object> fragment =
+                UnifiedCharacterSnapshot.readFragment(
+                    dir,
+                    gson,
+                    dataset
+                );
+
+            DatasetFreshness.Observation observation =
+                DatasetFreshness.evaluate(
+                    dataset,
+                    fragment,
+                    ExportLayout.datasetPath(dir, dataset),
+                    sessionId
+                );
+
+            boolean needsRefresh =
+                dataset == ExportDataset.COLLECTION_LOG
+                    ? observation.status() ==
+                        DatasetFreshness.Status.UNKNOWN
+                    : !observation.currentSession();
+
+            if (needsRefresh)
+            {
+                pending.add(dataset.label());
+            }
+        }
+
+        if (pending.isEmpty())
+        {
+            interactionNoteLabel.setText(
+                "<html><b>Interactive data:</b><br>" +
+                    "No refresh needed</html>"
+            );
+            interactionNoteLabel.setForeground(
+                ColorScheme.PROGRESS_COMPLETE_COLOR
+            );
+            return;
+        }
+
+        interactionNoteLabel.setText(
+            "<html><b>Open in game to refresh:</b><br>" +
+                String.join(" · ", pending) +
+                "</html>"
+        );
+        interactionNoteLabel.setForeground(STALE_COLOR);
+    }
+
+    private boolean hasDatasetFile(ExportDataset dataset)
+    {
+        Path dir = currentOutputDir;
+        if (dir == null)
+        {
+            return false;
+        }
+
+        return Files.isRegularFile(
+            ExportLayout.panelPath(dir, dataset)
+        ) ||
+            Files.isRegularFile(
+                ExportLayout.datasetPath(dir, dataset)
+            );
+    }
+
+    private void recordManualOutcome(
+        ExportDataset dataset,
+        SyncOutcome outcome)
+    {
+        boolean complete = false;
+
         synchronized (manualSyncLock)
         {
             if (!manualSyncInProgress)
@@ -507,49 +982,45 @@ class CharacterStateExporterPanel extends PluginPanel
                 return;
             }
 
-            manualSyncOutcomes.put(datasetKey, outcome);
-            if (manualSyncOutcomes.size() == DATASET_KEYS.length)
+            manualSyncOutcomes.put(dataset.key(), outcome);
+            if (manualSyncOutcomes.size() >=
+                ExportDataset.values().length)
             {
                 manualSyncInProgress = false;
+                complete = true;
             }
+        }
+
+        if (complete)
+        {
+            runOnEdt(() ->
+            {
+                refreshButton.setText("Refresh Now");
+                refreshButton.setEnabled(true);
+            });
         }
     }
 
-    static String formatStatusTime(Instant instant)
+    private void setRowState(
+        ExportDataset dataset,
+        String primary,
+        String detail,
+        Color color,
+        String tooltip)
     {
-        ZonedDateTime localTime = instant.atZone(ZoneId.systemDefault());
-        return localTime.toLocalTime().format(TIME_FMT);
-    }
-
-    static String formatStatusTooltip(Instant instant, String prefix)
-    {
-        ZonedDateTime localTime = instant.atZone(ZoneId.systemDefault());
-        return prefix + " " + localTime.format(DATE_TIME_FMT);
-    }
-
-    private void rebuildOpenFileDropdown()
-    {
-        if (openFileDropdown == null)
+        StatusRow row = statusRows.get(dataset);
+        if (row == null)
         {
             return;
         }
 
-        dropdownRebuilding = true;
-        openFileDropdown.removeAllItems();
+        row.primary.setText(primary);
+        row.primary.setForeground(color);
+        row.primary.setToolTipText(tooltip);
 
-        Path dir = currentOutputDir;
-        for (int i = 0; i < DATASET_KEYS.length; i++)
-        {
-            String datasetKey = DATASET_KEYS[i];
-            String fileName = datasetFiles.get(datasetKey);
-            if (dir != null && fileName != null && Files.exists(dir.resolve(fileName)))
-            {
-                openFileDropdown.addItem(DATASET_LABELS[i]);
-            }
-        }
-
-        openFileDropdown.setEnabled(openFileDropdown.getItemCount() > 0);
-        dropdownRebuilding = false;
+        row.detail.setText(detail);
+        row.detail.setForeground(color);
+        row.detail.setToolTipText(tooltip);
     }
 
     private void openOutputFolder()
@@ -564,58 +1035,125 @@ class CharacterStateExporterPanel extends PluginPanel
         {
             Desktop.getDesktop().open(dir.toFile());
         }
-        catch (IOException | UnsupportedOperationException ex)
+        catch (IOException |
+               UnsupportedOperationException ex)
         {
-            log.debug("Could not open output folder: {}", ex.toString());
+            log.debug(
+                "Could not open output folder: {}",
+                ex.toString()
+            );
         }
     }
 
-    private void openDatasetFile(String datasetKey)
+    private static void runOnEdt(Runnable action)
     {
-        Path dir = currentOutputDir;
-        String fileName = datasetFiles.get(datasetKey);
-        if (dir == null || fileName == null)
+        if (SwingUtilities.isEventDispatchThread())
         {
-            return;
+            action.run();
         }
-
-        Path file = dir.resolve(fileName);
-        if (!Files.isRegularFile(file))
+        else
         {
-            return;
-        }
-
-        try
-        {
-            Desktop.getDesktop().open(file.toFile());
-        }
-        catch (IOException | UnsupportedOperationException ex)
-        {
-            log.debug("Could not open dataset file {}: {}", file, ex.toString());
+            SwingUtilities.invokeLater(action);
         }
     }
 
-    private void handleOpenFileSelection()
+    static String formatStatusTime(Instant instant)
     {
-        if (dropdownRebuilding)
+        ZonedDateTime local =
+            instant.atZone(ZoneId.systemDefault());
+        return local.toLocalTime().format(TIME_FMT);
+    }
+
+    static String formatStatusTooltip(
+        Instant instant,
+        String prefix)
+    {
+        ZonedDateTime local =
+            instant.atZone(ZoneId.systemDefault());
+        return prefix + " " + local.format(DATE_TIME_FMT);
+    }
+
+    static String formatRelativeAge(Instant instant)
+    {
+        long minutes = Math.max(
+            0L,
+            Duration.between(
+                instant,
+                Instant.now()
+            ).toMinutes()
+        );
+
+        if (minutes < 60L)
         {
-            return;
+            return minutes + "m ago";
         }
 
-        Object selected = openFileDropdown.getSelectedItem();
-        if (!(selected instanceof String))
+        long hours = minutes / 60L;
+        if (hours < 48L)
         {
-            return;
+            return hours + "h ago";
         }
 
-        String label = (String) selected;
-        for (int i = 0; i < DATASET_LABELS.length; i++)
+        long days = hours / 24L;
+        long remainingHours = hours % 24L;
+        if (days < 7L && remainingHours > 0L)
         {
-            if (DATASET_LABELS[i].equals(label))
-            {
-                openDatasetFile(DATASET_KEYS[i]);
-                break;
-            }
+            return days + "d " +
+                remainingHours + "h ago";
         }
+
+        return days + "d ago";
+    }
+
+    private static String formatDetailedAge(Instant instant)
+    {
+        long minutes = Math.max(
+            0L,
+            Duration.between(
+                instant,
+                Instant.now()
+            ).toMinutes()
+        );
+
+        long days = minutes / (24L * 60L);
+        long hours = (minutes / 60L) % 24L;
+        long remainingMinutes = minutes % 60L;
+
+        if (days > 0L)
+        {
+            return days + "d " +
+                hours + "h " +
+                remainingMinutes + "m";
+        }
+
+        if (hours > 0L)
+        {
+            return hours + "h " +
+                remainingMinutes + "m";
+        }
+
+        return remainingMinutes + "m";
+    }
+
+    private static String formatInteractiveTooltip(
+        ExportDataset dataset,
+        Instant instant)
+    {
+        ZonedDateTime local =
+            instant.atZone(ZoneId.systemDefault());
+
+        String instruction =
+            dataset.refreshAction() == null
+                ? "Expose this data in-game to refresh."
+                : dataset.refreshAction() + " to refresh.";
+
+        return "<html>" +
+            "Last observed: " +
+            local.format(DATE_TIME_FMT) +
+            "<br>Age: " +
+            formatDetailedAge(instant) +
+            "<br>" +
+            instruction +
+            "</html>";
     }
 }

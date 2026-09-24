@@ -10,8 +10,7 @@ repositories {
     }
 }
 
-// Pin the RuneLite client version the plugin is built against. Bump this
-// alongside hub resubmissions so reviewers can reproduce the build.
+// Build against the current RuneLite release, matching Plugin Hub convention.
 def runeLiteVersion = 'latest.release'
 def lombokVersion = '1.18.30'
 def pluginMainClass = 'com.dzwnk.exporter.CharacterStateExporterPluginTest'
@@ -27,7 +26,7 @@ dependencies {
 }
 
 group = 'com.dzwnk'
-version = '0.6.0'
+version = '0.9.1-refactor-rc6'
 
 java {
     sourceCompatibility = JavaVersion.VERSION_11

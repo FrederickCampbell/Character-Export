@@ -28,14 +28,46 @@ package com.dzwnk.exporter;
 import net.runelite.client.config.Config;
 import net.runelite.client.config.ConfigGroup;
 import net.runelite.client.config.ConfigItem;
+import net.runelite.client.config.ConfigSection;
 
 @ConfigGroup("characterStateExporter")
 public interface CharacterStateExporterConfig extends Config
 {
+    @ConfigSection(
+        name = "Core snapshots",
+        description = "Primary account-state JSON snapshots.",
+        position = 0
+    )
+    String coreSection = "coreSection";
+
+    @ConfigSection(
+        name = "Items & storage",
+        description = "Item snapshots. storage.json is populated automatically from Dude, Where's My Stuff? when available.",
+        position = 1
+    )
+    String itemsSection = "itemsSection";
+
+    @ConfigSection(
+        name = "Progress & live",
+        description = "Progress telemetry, travel gates, activities, and live player state.",
+        position = 2
+    )
+    String progressSection = "progressSection";
+
+    @ConfigSection(
+        name = "Diagnostics",
+        description = "Optional developer diagnostics. Public exports do not depend on these files.",
+        position = 3,
+        closedByDefault = true
+    )
+    String diagnosticsSection = "diagnosticsSection";
+
     @ConfigItem(
         keyName = "exportCharacter",
-        name = "Export character",
-        description = "Write character stats and lightweight live state"
+        name = "Character",
+        description = "Write character.json with account identity, world, and skills.",
+        position = 0,
+        section = coreSection
     )
     default boolean exportCharacter()
     {
@@ -44,8 +76,10 @@ public interface CharacterStateExporterConfig extends Config
 
     @ConfigItem(
         keyName = "exportQuests",
-        name = "Export quests",
-        description = "Write quest state snapshot"
+        name = "Quests",
+        description = "Write quests.json with current quest states and counts.",
+        position = 1,
+        section = coreSection
     )
     default boolean exportQuests()
     {
@@ -54,8 +88,10 @@ public interface CharacterStateExporterConfig extends Config
 
     @ConfigItem(
         keyName = "exportDiaries",
-        name = "Export diaries",
-        description = "Write achievement diary completion state"
+        name = "Achievement diaries",
+        description = "Write diaries.json with achievement diary completion state.",
+        position = 2,
+        section = coreSection
     )
     default boolean exportDiaries()
     {
@@ -64,8 +100,10 @@ public interface CharacterStateExporterConfig extends Config
 
     @ConfigItem(
         keyName = "exportCombatAchievements",
-        name = "Export combat achievements",
-        description = "Write combat achievement tier and task completion state"
+        name = "Combat achievements",
+        description = "Write combat_achievements.json with catalogue, tier, and task completion state.",
+        position = 3,
+        section = coreSection
     )
     default boolean exportCombatAchievements()
     {
@@ -73,29 +111,11 @@ public interface CharacterStateExporterConfig extends Config
     }
 
     @ConfigItem(
-        keyName = "exportBank",
-        name = "Export bank",
-        description = "Write bank snapshot on bank container changes"
-    )
-    default boolean exportBank()
-    {
-        return true;
-    }
-
-    @ConfigItem(
-        keyName = "exportSeedVault",
-        name = "Export seed vault",
-        description = "Write seed vault snapshot on seed-vault container changes"
-    )
-    default boolean exportSeedVault()
-    {
-        return true;
-    }
-
-    @ConfigItem(
         keyName = "exportInventory",
-        name = "Export inventory",
-        description = "Write carried-inventory snapshot on inventory container changes"
+        name = "Inventory",
+        description = "Write inventory.json from the carried inventory.",
+        position = 0,
+        section = itemsSection
     )
     default boolean exportInventory()
     {
@@ -104,8 +124,10 @@ public interface CharacterStateExporterConfig extends Config
 
     @ConfigItem(
         keyName = "exportEquipment",
-        name = "Export equipment",
-        description = "Write worn-equipment snapshot on equipment container changes"
+        name = "Equipment",
+        description = "Write equipment.json from worn equipment.",
+        position = 1,
+        section = itemsSection
     )
     default boolean exportEquipment()
     {
@@ -113,9 +135,35 @@ public interface CharacterStateExporterConfig extends Config
     }
 
     @ConfigItem(
+        keyName = "exportBank",
+        name = "Bank",
+        description = "Write bank.json when the Bank container is observable. Open the Bank to refresh it.",
+        position = 2,
+        section = itemsSection
+    )
+    default boolean exportBank()
+    {
+        return true;
+    }
+
+    @ConfigItem(
+        keyName = "exportSeedVault",
+        name = "Seed Vault",
+        description = "Write seed_vault.json when the Seed Vault is observable. Open the Seed Vault to refresh it.",
+        position = 3,
+        section = itemsSection
+    )
+    default boolean exportSeedVault()
+    {
+        return true;
+    }
+
+    @ConfigItem(
         keyName = "exportCollectionLog",
-        name = "Export collection log",
-        description = "Write collection log entries as you browse each page in-game"
+        name = "Collection Log",
+        description = "Write collection_log.json. Open your own Collection Log once for a complete ownership snapshot.",
+        position = 4,
+        section = itemsSection
     )
     default boolean exportCollectionLog()
     {
@@ -123,9 +171,47 @@ public interface CharacterStateExporterConfig extends Config
     }
 
     @ConfigItem(
+        keyName = "exportRawVariables",
+        name = "Progress variables",
+        description = "Write curated VarBit/VarPlayer telemetry into progress.json.",
+        position = 0,
+        section = progressSection
+    )
+    default boolean exportRawVariables()
+    {
+        return true;
+    }
+
+    @ConfigItem(
+        keyName = "exportTravelState",
+        name = "Travel gates",
+        description = "Write travel requirement state into progress.json without claiming full transport availability.",
+        position = 1,
+        section = progressSection
+    )
+    default boolean exportTravelState()
+    {
+        return true;
+    }
+
+    @ConfigItem(
+        keyName = "exportUniversalState",
+        name = "Live & activities",
+        description = "Write activities.json and live.json with Slayer, Grand Exchange, recurring markers, and current player state.",
+        position = 2,
+        section = progressSection
+    )
+    default boolean exportUniversalState()
+    {
+        return true;
+    }
+
+    @ConfigItem(
         keyName = "debugLogging",
         name = "Debug logging",
-        description = "Write detailed export trigger and result logs to exporter.log, status.json, and recent_events.json in the output folder. Takes effect immediately — no restart needed."
+        description = "Write exporter.log, status.json, and recent_events.json under diagnostics/. Takes effect immediately.",
+        position = 0,
+        section = diagnosticsSection
     )
     default boolean debugLogging()
     {
